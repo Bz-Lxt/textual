@@ -29,7 +29,8 @@ from textual.document._document import (
     _utf8_encode,
 )
 from textual.document._document_navigator import DocumentNavigator
-from textual.document._edit import Edit
+from textual.document._document_share import DocumentShare, get_document_share
+from textual.document._edit import Edit, shift_selection
 from textual.document._history import EditHistory
 from textual.document._syntax_aware_document import (
     SyntaxAwareDocument,
@@ -585,6 +586,7 @@ TextArea {
         self,
         text: str = "",
         *,
+        document: DocumentBase | None = None,
         language: str | None = None,
         theme: str = "css",
         soft_wrap: bool = True,
@@ -607,6 +609,12 @@ TextArea {
 
         Args:
             text: The initial text to load into the TextArea.
+            document: An existing document to edit. If the same `Document`
+                instance is passed to multiple `TextArea` widgets, then they
+                share their text and undo/redo history, while each one keeps an
+                independent cursor, selection, soft wrapping, scroll position
+                and syntax highlighting. When provided, this takes precedence
+                over `text`.
             language: The language to use.
             theme: The theme to use.
             soft_wrap: Enable soft wrapping.
@@ -644,12 +652,25 @@ TextArea {
         self._word_pattern = re.compile(r"(?<=\W)(?=\w)|(?<=\w)(?=\W)")
         """Compiled regular expression for what we consider to be a 'word'."""
 
-        self.history: EditHistory = EditHistory(
-            max_checkpoints=max_checkpoints,
-            checkpoint_timer=2.0,
-            checkpoint_max_characters=100,
-        )
-        """A stack (the end of the list is the top of the stack) for tracking edits."""
+        if document is not None:
+            # Sharing a document: the seed document links this TextArea to the
+            # same DocumentShare as every other TextArea constructed with it.
+            text = document.text
+            self._document_share: DocumentShare = get_document_share(
+                document, max_checkpoints
+            )
+        else:
+            # No shared document: use a private share (with a single member) so
+            # the edit/undo/redo code paths are identical.
+            self._document_share = DocumentShare(max_checkpoints)
+        self._document_share.add(self)
+
+        self.history: EditHistory = self._document_share.history
+        """A stack (the end of the list is the top of stack) for tracking edits.
+
+        When multiple `TextArea` widgets share a document, this history is the
+        same object for every linked widget.
+        """
 
         self._selecting = False
         """True if we're currently selecting text using the mouse, otherwise False."""
@@ -710,6 +731,7 @@ TextArea {
         cls,
         text: str = "",
         *,
+        document: DocumentBase | None = None,
         language: str | None = None,
         theme: str = "monokai",
         soft_wrap: bool = False,
@@ -735,6 +757,9 @@ TextArea {
 
         Args:
             text: The initial text to load into the TextArea.
+            document: An existing document to edit. Passing the same `Document`
+                to multiple editors shares text and undo/redo history; takes
+                precedence over `text`.
             language: The language to use.
             theme: The theme to use.
             soft_wrap: Enable soft wrapping.
@@ -753,6 +778,7 @@ TextArea {
         """
         return cls(
             text,
+            document=document,
             language=language,
             theme=theme,
             soft_wrap=soft_wrap,
@@ -1206,13 +1232,24 @@ TextArea {
 
         This will replace the text currently in the TextArea and clear the edit history.
 
+        If other `TextArea` widgets share a document with this one, then the new
+        text is loaded into all of them and the shared history is cleared. Each
+        area keeps its own wrapping, scroll position and highlighting settings,
+        though all cursors move to the start of the newly loaded text.
+
         Args:
             text: The text to load into the TextArea.
         """
         self.history.clear()
+        other_areas = self._document_share.others(self)
         self._set_document(text, self.language)
+        for area in other_areas:
+            area._set_document(text, area.language)
         self.post_message(self.Changed(self).set_sender(self))
         self.update_suggestion()
+        for area in other_areas:
+            area.post_message(area.Changed(area).set_sender(area))
+            area.update_suggestion()
 
     def _on_resize(self) -> None:
         self._rewrap_and_refresh_virtual_size()
@@ -1668,8 +1705,73 @@ TextArea {
         start, end = sorted((start, end))
         return self.document.get_text_range(start, end)
 
+    # --- Shared document handling
+    @property
+    def document_share(self) -> DocumentShare:
+        """The share coordinating this area with any other `TextArea` widgets
+        that edit the same document.
+
+        The share owns the shared undo/redo history and the registry of linked
+        areas. Areas constructed without an explicit shared `Document` have a
+        private share containing only themselves.
+        """
+        return self._document_share
+
+    def _clamp_selection(self, selection: Selection) -> Selection:
+        """Clamp both ends of a selection to locations visitable in this area."""
+        return Selection(
+            self.clamp_visitable(selection.start),
+            self.clamp_visitable(selection.end),
+        )
+
+    def _rewrap_after_replace(
+        self,
+        top: Location,
+        old_bottom: Location,
+        new_bottom: Location,
+        old_gutter_width: int,
+    ) -> None:
+        """Re-wrap this view after a replacement.
+
+        A full re-wrap is performed if the gutter width changed (e.g. a newline
+        added a line), otherwise only the affected range is re-wrapped.
+
+        Args:
+            top: The top of the affected range.
+            old_bottom: The end of the range before the replacement.
+            new_bottom: The end of the range after the replacement.
+            old_gutter_width: The gutter width from before the replacement.
+        """
+        if old_gutter_width != self.gutter_width:
+            self.wrapped_document.wrap(self.wrap_width, self.indent_width)
+        else:
+            self.wrapped_document.wrap_range(top, old_bottom, new_bottom)
+
+    def _refresh_after_remote_replace(self, target_selection: Selection) -> None:
+        """Refresh this view after a replacement originating in a linked area.
+
+        The linked document has already been mutated and re-wrapped; this moves
+        this area's independent selection to track the edit, then refreshes the
+        cursor, highlights and virtual size, and emits a `Changed` message.
+
+        Args:
+            target_selection: Where this area's selection should move to.
+        """
+        self.selection = target_selection
+        self.record_cursor_width()
+        self._build_highlight_map()
+        self.post_message(self.Changed(self))
+        self.update_suggestion()
+        self._refresh_size()
+
     def edit(self, edit: Edit) -> EditResult:
         """Perform an Edit.
+
+        If other `TextArea` widgets share a document with this one, the same
+        replacement is applied to each of their documents (exactly once), and
+        each linked area refreshes independently using its own wrapping,
+        selection and highlighting. The edit is recorded once in the shared
+        history.
 
         Args:
             edit: The Edit to perform.
@@ -1682,29 +1784,58 @@ TextArea {
             self.suggestion = self.suggestion[len(edit.text) :]
         else:
             self.suggestion = ""
-        old_gutter_width = self.gutter_width
+
+        other_areas = self._document_share.others(self)
+        all_areas = [self, *other_areas]
+        old_gutter_widths = {area: area.gutter_width for area in all_areas}
+
+        # Perform the edit in the originating area, and record it once in the
+        # shared undo/redo history.
         result = edit.do(self)
         self.history.record(edit)
-        new_gutter_width = self.gutter_width
 
-        if old_gutter_width != new_gutter_width:
-            self.wrapped_document.wrap(self.wrap_width, self.indent_width)
-        else:
-            self.wrapped_document.wrap_range(
+        # Apply the identical replacement to the document of every other linked
+        # area, and compute where each area's independent selection moves to.
+        target_selections: dict[TextArea, Selection] = {}
+        for area in other_areas:
+            area.document.replace_range(edit.top, edit.bottom, edit.text)
+            if edit.maintain_selection_offset:
+                target_selection = area._clamp_selection(
+                    shift_selection(area.selection, edit.bottom, result.end_location)
+                )
+            else:
+                target_selection = Selection.cursor(result.end_location)
+            target_selections[area] = target_selection
+
+        # Re-wrap the affected range in every view (each has its own width).
+        for area in all_areas:
+            area._rewrap_after_replace(
                 edit.top,
                 edit.bottom,
                 result.end_location,
+                old_gutter_widths[area],
             )
 
+        # Refresh the originating area in its original update order.
         edit.after(self)
         self._build_highlight_map()
         self.post_message(self.Changed(self))
         self.update_suggestion()
         self._refresh_size()
+
+        # Refresh the other linked views, applying their own selections.
+        for area in other_areas:
+            area._refresh_after_remote_replace(target_selections[area])
+
         return result
 
     def undo(self) -> None:
-        """Undo the edits since the last checkpoint (the most recent batch of edits)."""
+        """Undo the edits since the last checkpoint (the most recent batch of edits).
+
+        When areas share a document, the batch is popped from the shared history
+        and reversed in every linked area, regardless of which area initiates
+        the undo.
+        """
         if edits := self.history._pop_undo():
             self._undo_batch(edits)
 
@@ -1713,7 +1844,12 @@ TextArea {
         self.undo()
 
     def redo(self) -> None:
-        """Redo the most recently undone batch of edits."""
+        """Redo the most recently undone batch of edits.
+
+        When areas share a document, the batch is taken from the shared history
+        and re-applied in every linked area, regardless of which area initiates
+        the redo.
+        """
         if edits := self.history._pop_redo():
             self._redo_batch(edits)
 
@@ -1729,21 +1865,44 @@ TextArea {
         There must be no edits missing from the sequence, or the resulting content
         will be incorrect.
 
+        If other `TextArea` widgets share a document with this one, the inverse
+        of every edit is also applied to their documents, tracking each view's
+        independent selection through the changes.
+
         Args:
             edits: The edits to undo, in the order they were originally performed.
         """
         if not edits:
             return
 
-        old_gutter_width = self.gutter_width
+        other_areas = self._document_share.others(self)
+        all_areas = [self, *other_areas]
+        old_gutter_widths = {area: area.gutter_width for area in all_areas}
+
         minimum_top = edits[-1].top
         maximum_old_bottom = (0, 0)
         maximum_new_bottom = (0, 0)
+        target_selections = {area: area.selection for area in other_areas}
+
         for edit in reversed(edits):
             edit.undo(self)
             end_location = (
                 edit._edit_result.end_location if edit._edit_result else (0, 0)
             )
+            replaced_text = (
+                edit._edit_result.replaced_text if edit._edit_result else ""
+            )
+
+            # Reverse the same edit in every linked document, and shift each
+            # view's independent selection through the inverse replacement.
+            for area in other_areas:
+                area.document.replace_range(edit.top, end_location, replaced_text)
+                target_selections[area] = area._clamp_selection(
+                    shift_selection(
+                        target_selections[area], end_location, edit.bottom
+                    )
+                )
+
             if edit.top < minimum_top:
                 minimum_top = edit.top
             if end_location > maximum_old_bottom:
@@ -1751,12 +1910,12 @@ TextArea {
             if edit.bottom > maximum_new_bottom:
                 maximum_new_bottom = edit.bottom
 
-        new_gutter_width = self.gutter_width
-        if old_gutter_width != new_gutter_width:
-            self.wrapped_document.wrap(self.wrap_width, self.indent_width)
-        else:
-            self.wrapped_document.wrap_range(
-                minimum_top, maximum_old_bottom, maximum_new_bottom
+        for area in all_areas:
+            area._rewrap_after_replace(
+                minimum_top,
+                maximum_old_bottom,
+                maximum_new_bottom,
+                old_gutter_widths[area],
             )
 
         self._refresh_size()
@@ -1765,6 +1924,9 @@ TextArea {
         self._build_highlight_map()
         self.post_message(self.Changed(self))
         self.update_suggestion()
+
+        for area in other_areas:
+            area._refresh_after_remote_replace(target_selections[area])
 
     def _redo_batch(self, edits: Sequence[Edit]) -> None:
         """Redo a batch of Edits in order.
@@ -1776,21 +1938,43 @@ TextArea {
         There must be no edits missing from the sequence, or the resulting content
         will be incorrect.
 
+        If other `TextArea` widgets share a document with this one, every edit is
+        also re-applied to their documents, tracking each view's independent
+        selection through the changes.
+
         Args:
             edits: The edits to redo.
         """
         if not edits:
             return
 
-        old_gutter_width = self.gutter_width
+        other_areas = self._document_share.others(self)
+        all_areas = [self, *other_areas]
+        old_gutter_widths = {area: area.gutter_width for area in all_areas}
+
         minimum_top = edits[0].top
         maximum_old_bottom = (0, 0)
         maximum_new_bottom = (0, 0)
+        target_selections = {area: area.selection for area in other_areas}
+
         for edit in edits:
             edit.do(self, record_selection=False)
             end_location = (
                 edit._edit_result.end_location if edit._edit_result else (0, 0)
             )
+
+            # Re-apply the same edit to every linked document, and shift each
+            # view's independent selection through the replacement.
+            for area in other_areas:
+                area.document.replace_range(edit.top, edit.bottom, edit.text)
+                if edit.maintain_selection_offset:
+                    target_selection = shift_selection(
+                        target_selections[area], edit.bottom, end_location
+                    )
+                else:
+                    target_selection = Selection.cursor(end_location)
+                target_selections[area] = area._clamp_selection(target_selection)
+
             if edit.top < minimum_top:
                 minimum_top = edit.top
             if end_location > maximum_new_bottom:
@@ -1798,14 +1982,12 @@ TextArea {
             if edit.bottom > maximum_old_bottom:
                 maximum_old_bottom = edit.bottom
 
-        new_gutter_width = self.gutter_width
-        if old_gutter_width != new_gutter_width:
-            self.wrapped_document.wrap(self.wrap_width, self.indent_width)
-        else:
-            self.wrapped_document.wrap_range(
+        for area in all_areas:
+            area._rewrap_after_replace(
                 minimum_top,
                 maximum_old_bottom,
                 maximum_new_bottom,
+                old_gutter_widths[area],
             )
 
         self._refresh_size()
@@ -1814,6 +1996,9 @@ TextArea {
         self._build_highlight_map()
         self.post_message(self.Changed(self))
         self.update_suggestion()
+
+        for area in other_areas:
+            area._refresh_after_remote_replace(target_selections[area])
 
     async def _on_key(self, event: events.Key) -> None:
         """Handle key presses which correspond to document inserts."""
@@ -1917,6 +2102,11 @@ TextArea {
             self._toggle_cursor_blink_visible,
             pause=not (self.cursor_blink and self.has_focus),
         )
+
+    def _on_unmount(self, event: events.Unmount) -> None:
+        # Detach from the document share so closing this area neither touches
+        # the remaining areas nor keeps receiving their edit notifications.
+        self._document_share.discard(self)
 
     def _toggle_cursor_blink_visible(self) -> None:
         """Toggle visibility of the cursor for the purposes of 'cursor blink'."""

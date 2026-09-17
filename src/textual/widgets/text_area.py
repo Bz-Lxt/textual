@@ -7,6 +7,7 @@ from textual.document._document import (
     Selection,
 )
 from textual.document._document_navigator import DocumentNavigator
+from textual.document._document_share import DocumentShare
 from textual.document._edit import Edit
 from textual.document._history import EditHistory
 from textual.document._syntax_aware_document import SyntaxAwareDocument
@@ -26,9 +27,10 @@ __all__ = [
     "Document",
     "DocumentBase",
     "DocumentNavigator",
+    "DocumentShare",
     "Edit",
-    "EditResult",
     "EditHistory",
+    "EditResult",
     "EndColumn",
     "Highlight",
     "HighlightName",

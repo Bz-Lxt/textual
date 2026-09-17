@@ -9,6 +9,52 @@ if TYPE_CHECKING:
     from textual.widgets import TextArea
 
 
+def shift_selection(
+    selection: Selection, replaced_bottom: Location, new_end: Location
+) -> Selection:
+    """Shift a selection to account for a replacement performed on a document.
+
+    Locations after the replacement are shifted by the difference between the
+    end of the replaced range and the end location of the inserted text.
+    Locations on the replacement row are only shifted column-wise if they were
+    at or after the replacement's end column.
+
+    This is used both for the `TextArea` performing an edit and for other
+    `TextArea` widgets linked to the same document, so every view keeps an
+    independent selection that still tracks the change.
+
+    Args:
+        selection: The selection to shift.
+        replaced_bottom: The end location of the range that was replaced.
+        new_end: The end location after the replacement.
+
+    Returns:
+        The selection adjusted for the replacement.
+    """
+    edit_bottom_row, edit_bottom_column = replaced_bottom
+    new_edit_to_row, new_edit_to_column = new_end
+
+    column_offset = new_edit_to_column - edit_bottom_column
+    row_offset = new_edit_to_row - edit_bottom_row
+
+    def shift(location: Location) -> Location:
+        location_row, location_column = location
+        target_column = (
+            location_column + column_offset
+            if edit_bottom_row == location_row
+            and edit_bottom_column <= location_column
+            else location_column
+        )
+        target_row = (
+            location_row + row_offset
+            if edit_bottom_row <= location_row
+            else location_row
+        )
+        return target_row, target_column
+
+    return Selection(shift(selection.start), shift(selection.end))
+
+
 @dataclass
 class Edit:
     """Implements the Undoable protocol to replace text at some range within a document."""
@@ -50,52 +96,11 @@ class Edit:
 
         text = self.text
 
-        # This code is mostly handling how we adjust TextArea.selection
-        # when an edit is made to the document programmatically.
-        # We want a user who is typing away to maintain their relative
-        # position in the document even if an insert happens before
-        # their cursor position.
-
-        edit_bottom_row, edit_bottom_column = self.bottom
-
-        selection_start, selection_end = text_area.selection
-        selection_start_row, selection_start_column = selection_start
-        selection_end_row, selection_end_column = selection_end
-
         edit_result = text_area.document.replace_range(self.top, self.bottom, text)
 
-        new_edit_to_row, new_edit_to_column = edit_result.end_location
-
-        column_offset = new_edit_to_column - edit_bottom_column
-        target_selection_start_column = (
-            selection_start_column + column_offset
-            if edit_bottom_row == selection_start_row
-            and edit_bottom_column <= selection_start_column
-            else selection_start_column
-        )
-        target_selection_end_column = (
-            selection_end_column + column_offset
-            if edit_bottom_row == selection_end_row
-            and edit_bottom_column <= selection_end_column
-            else selection_end_column
-        )
-
-        row_offset = new_edit_to_row - edit_bottom_row
-        target_selection_start_row = (
-            selection_start_row + row_offset
-            if edit_bottom_row <= selection_start_row
-            else selection_start_row
-        )
-        target_selection_end_row = (
-            selection_end_row + row_offset
-            if edit_bottom_row <= selection_end_row
-            else selection_end_row
-        )
-
         if self.maintain_selection_offset:
-            self._updated_selection = Selection(
-                start=(target_selection_start_row, target_selection_start_column),
-                end=(target_selection_end_row, target_selection_end_column),
+            self._updated_selection = shift_selection(
+                text_area.selection, self.bottom, edit_result.end_location
             )
         else:
             self._updated_selection = Selection.cursor(edit_result.end_location)
