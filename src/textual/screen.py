@@ -429,7 +429,12 @@ class Screen(Generic[ScreenResultType], Widget):
             for filter_namespace in filter_namespaces:
                 check_consume_key = filter_namespace.check_consume_key
                 for key in list(bindings_map.key_to_bindings):
-                    if check_consume_key(key, key_to_character(key)):
+                    # For a key sequence, only the first key press can start
+                    # the sequence, so check whether the first key is consumed.
+                    first_key = key.split()[0]
+                    if check_consume_key(
+                        first_key, key_to_character(first_key)
+                    ):
                         # If the widget consumes the key (e.g. like an Input widget),
                         # then remove the key from the bindings map.
                         del bindings_map.key_to_bindings[key]

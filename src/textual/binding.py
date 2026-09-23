@@ -33,7 +33,14 @@ KeyString: TypeAlias = str
 """A string that represents a key binding.
 
 For example, "x", "ctrl+i", "ctrl+shift+a", "ctrl+j,space,x", etc.
+
+Commas separate *aliases* (alternative keys), while whitespace separates
+the keys of a *key sequence* (keys that must be pressed one after another).
+For example, ``"ctrl+x s"`` requires pressing ``ctrl+x`` followed by ``s``.
 """
+
+KeySequence: TypeAlias = "tuple[str, ...]"
+"""The individual key presses that make up a key sequence."""
 
 Keymap = Mapping[BindingIDString, KeyString]
 """A mapping of binding IDs to key strings, used for overriding default key bindings."""
@@ -51,12 +58,49 @@ class InvalidBinding(Exception):
     """Binding key is in an invalid format."""
 
 
+def _normalize_key(key: str) -> str:
+    """Normalize a single key (one step within a key sequence).
+
+    Single character keys are expanded to their long form.
+    """
+    return _character_to_key(key) if len(key) == 1 else key
+
+
+def parse_key_string(key_string: str) -> list[tuple[str, ...]]:
+    """Parse a key string into a list of aliases.
+
+    Commas separate aliases (alternative keys) and whitespace separates
+    the individual key presses of a key sequence.
+
+    Args:
+        key_string: A key string, e.g. ``"a,b"`` or ``"ctrl+x s"``.
+
+    Returns:
+        A list of key sequences, one per alias. A key sequence is a tuple
+        of key identifiers, e.g. ``[("ctrl+x", "s")]`` for ``"ctrl+x s"``.
+
+    Raises:
+        InvalidBinding: If any alias or sequence step is empty.
+    """
+    aliases: list[tuple[str, ...]] = []
+    for alias in key_string.split(","):
+        keys = tuple(_normalize_key(key) for key in alias.split())
+        if not keys or any(not key for key in keys):
+            raise InvalidBinding(f"Can not bind empty string in {key_string!r}")
+        aliases.append(keys)
+    return aliases
+
+
 @dataclass(frozen=True)
 class Binding:
     """The configuration of a key binding."""
 
     key: str
-    """Key to bind. This can also be a comma-separated list of keys to map multiple keys to a single action."""
+    """Key to bind. This can also be a comma-separated list of keys to map multiple keys to a single action.
+
+    Whitespace within an alias defines a *key sequence*, i.e. keys that must be
+    pressed one after another, such as ``"ctrl+x s"``.
+    """
     action: str
     """Action to bind to."""
     description: str = ""
@@ -106,6 +150,20 @@ class Binding:
         *modifiers, key = self.key.split("+")
         return modifiers, key
 
+    @property
+    def key_sequence(self) -> tuple[str, ...]:
+        """The key presses that make up this binding.
+
+        A plain key returns a tuple of one. A key sequence (whitespace
+        separated, such as ``"ctrl+x s"``) returns one entry per key press.
+        """
+        return tuple(self.key.split())
+
+    @property
+    def is_sequence(self) -> bool:
+        """`True` if the binding requires more than one key press."""
+        return len(self.key_sequence) > 1
+
     def with_key(self, key: str, key_display: str | None = None) -> Binding:
         """Return a new binding with the key and key_display set to the specified values.
 
@@ -143,16 +201,11 @@ class Binding:
                 binding = Binding(*binding)  # type: ignore[reportArgumentType]
 
             # At this point we have a Binding instance, but the key may
-            # be a list of keys, so now we unroll that single Binding
-            # into a (potential) collection of Binding instances.
-            for key in binding.key.split(","):
-                key = key.strip()
-                if not key:
-                    raise InvalidBinding(
-                        f"Can not bind empty string in {binding.key!r}"
-                    )
-                if len(key) == 1:
-                    key = _character_to_key(key)
+            # be a list of aliases and/or key sequences, so now we unroll
+            # that single Binding into a (potential) collection of Binding
+            # instances.
+            for key_sequence in parse_key_string(binding.key):
+                key = " ".join(key_sequence)
 
                 yield Binding(
                     key=key,
@@ -291,7 +344,11 @@ class BindingsMap:
 
                 # If the keymap has an override for this binding ID
                 if keymap_key_string := keymap.get(binding_id):
-                    keymap_keys = keymap_key_string.split(",")
+                    # Normalize each alias (single characters and key sequences)
+                    keymap_keys = [
+                        " ".join(key_sequence)
+                        for key_sequence in parse_key_string(keymap_key_string)
+                    ]
 
                     # Remove the old binding
                     for key, key_bindings in key_to_bindings:
@@ -355,25 +412,25 @@ class BindingsMap:
         """Bind keys to an action.
 
         Args:
-            keys: The keys to bind. Can be a comma-separated list of keys.
+            keys: The keys to bind. Can be a comma-separated list of keys,
+                where an alias may itself be a key sequence (whitespace
+                separated key presses).
             action: The action to bind the keys to.
             description: An optional description for the binding.
             show: A flag to say if the binding should appear in the footer.
             key_display: Optional string to display in the footer for the key.
             priority: Is this a priority binding, checked form app down to focused widget?
         """
-        all_keys = [key.strip() for key in keys.split(",")]
-        for key in all_keys:
-            self.key_to_bindings.setdefault(key, []).append(
-                Binding(
-                    key,
-                    action,
-                    description,
-                    show=bool(description and show),
-                    key_display=key_display,
-                    priority=priority,
-                )
-            )
+        binding = Binding(
+            keys,
+            action,
+            description,
+            show=bool(description and show),
+            key_display=key_display,
+            priority=priority,
+        )
+        for expanded_binding in Binding.make_bindings([binding]):
+            self._add_binding(expanded_binding)
 
     def get_bindings_for_key(self, key: str) -> list[Binding]:
         """Get a list of bindings for a given key.

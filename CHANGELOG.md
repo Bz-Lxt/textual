@@ -5,6 +5,12 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](http://keepachangelog.com/)
 and this project adheres to [Semantic Versioning](http://semver.org/).
 
+## Unreleased
+
+### Added
+
+- Added support for key sequences in bindings. Whitespace separates consecutive key presses (e.g. `Binding("ctrl+x s", "save")`), while commas still separate aliases. Longer sequences sharing a prefix take priority over shorter bindings; `App.KEY_SEQUENCE_TIMEOUT` (1 second by default) controls how long Textual waits for the next press. Pressing another key releases the buffered presses as ordinary input, `escape` cancels the sequence, and pending sequences are discarded on focus changes or rebinding.
+
 ## [8.2.8] - 2026-06-30
 
 ### Fixed

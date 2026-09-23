@@ -94,7 +94,9 @@ class BindingsTable(Static):
             get_key_display = self.app.get_key_display
             for multi_bindings in action_to_bindings.values():
                 binding, enabled, tooltip = multi_bindings[0]
-                keys_display = " ".join(
+                # Aliases are joined with a comma; key presses within a
+                # sequence are joined with a space (see get_key_display).
+                keys_display = ", ".join(
                     dict.fromkeys(  # Remove duplicates while preserving order
                         get_key_display(binding) for binding, _, _ in multi_bindings
                     )

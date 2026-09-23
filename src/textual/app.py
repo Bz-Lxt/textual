@@ -112,6 +112,7 @@ from textual.keys import (
     _get_unicode_name_from_key,
     _normalize_key_list,
     format_key,
+    key_to_character,
 )
 from textual.messages import CallbackType, Prune
 from textual.notifications import Notification, Notifications, Notify, SeverityLevel
@@ -292,6 +293,18 @@ class _PrintCapture:
         return -1
 
 
+class _ReplayedKey(events.Key):
+    """A key event replayed after a key sequence was abandoned.
+
+    Replayed keys behave like ordinary key presses, but they never start
+    a new key sequence (only exact single-press bindings are considered).
+    """
+
+
+# Dispatch replayed keys through the same handlers as ordinary key presses.
+_ReplayedKey.handler_name = "on_key"
+
+
 @rich.repr.auto
 class App(Generic[ReturnType], DOMNode):
     """The base class for Textual Applications."""
@@ -450,6 +463,15 @@ class App(Generic[ReturnType], DOMNode):
     CLICK_CHAIN_TIME_THRESHOLD: ClassVar[float] = 0.5
     """The maximum number of seconds between clicks to upgrade a single click to a double click, 
     a double click to a triple click, etc."""
+
+    KEY_SEQUENCE_TIMEOUT: ClassVar[float] = 1.0
+    """The number of seconds to wait for the next key in a key sequence.
+
+    When a key is both a complete binding and a prefix of a longer key
+    sequence, Textual waits this long for another key press. If it expires,
+    the shorter binding is invoked (or the buffered keys are released as
+    ordinary input if there is no complete binding).
+    """
 
     BINDINGS: ClassVar[list[BindingType]] = [
         Binding(
@@ -740,6 +762,18 @@ class App(Generic[ReturnType], DOMNode):
         self._registry: WeakSet[DOMNode] = WeakSet()
 
         self._keymap: Keymap = {}
+
+        # Pending key sequence state (keys pressed so far, phase, timeout)
+        self._key_sequence: tuple[str, ...] = ()
+        """The key presses buffered while matching a key sequence."""
+        self._key_sequence_priority: bool = False
+        """Whether the pending sequence was armed in the priority phase."""
+        self._key_sequence_timer: Timer | None = None
+        """Timer that fires when the pending key sequence times out."""
+        self._key_sequence_focused: Widget | None = None
+        """The focused widget when the pending sequence was armed."""
+        self._key_sequence_signature: frozenset[tuple[object, ...]] = frozenset()
+        """Snapshot of the active bindings when the sequence was armed."""
 
         # Sensitivity on X is double the sensitivity on Y to account for
         # cells being twice as tall as wide
@@ -2013,6 +2047,11 @@ class App(Generic[ReturnType], DOMNode):
     def get_key_display(self, binding: Binding) -> str:
         """Format a bound key for display in footer / key panel etc.
 
+        Key sequences (keys pressed one after another) are joined with a
+        space. Note that aliases for the same action are displayed
+        separately (or joined with a comma in the key panel), so sequences
+        and aliases are visually distinct.
+
         !!! note
             You can implement this in a subclass if you want to change how keys are displayed in your app.
 
@@ -2026,18 +2065,31 @@ class App(Generic[ReturnType], DOMNode):
         if binding.key_display:
             return binding.key_display
 
+        # Format each key press of the sequence, separated by spaces
+        return " ".join(self._format_key(key) for key in binding.key.split())
+
+    @staticmethod
+    def _format_key(key: str) -> str:
+        """Format a single key (no sequences) for display.
+
+        Args:
+            key: A key identifier, e.g. ``"ctrl+a"``.
+
+        Returns:
+            A display string for the key.
+        """
         # Extract modifiers
-        modifiers, key = binding.parse_key()
+        *modifiers, last_key = key.split("+")
 
         # Format the key (replace unicode names with character)
-        key = format_key(key)
+        last_key = format_key(last_key)
 
         # Convert ctrl modifier to caret
         if "ctrl" in modifiers:
             modifiers.pop(modifiers.index("ctrl"))
-            key = f"^{key}"
+            last_key = f"^{last_key}"
         # Join everything with +
-        key_tokens = modifiers + [key]
+        key_tokens = modifiers + [last_key]
         return "+".join(key_tokens)
 
     async def _press_keys(self, keys: Iterable[str]) -> None:
@@ -3960,13 +4012,165 @@ class App(Generic[ReturnType], DOMNode):
 
         Args:
             key: Key to simulate. May also be the name of a key, e.g. "space".
+                Whitespace separates the key presses of a key sequence, e.g.
+                ``"ctrl+x s"``.
         """
-        self.post_message(events.Key(key, None))
+        # A key string containing whitespace represents a key sequence
+        for key_press in key.split():
+            self.post_message(events.Key(key_press, None))
 
-    async def _check_bindings(self, key: str, priority: bool = False) -> bool:
-        """Handle a key press.
+    def _iter_binding_candidates(
+        self, priority: bool
+    ) -> Iterator[tuple[DOMNode, Binding]]:
+        """Iterate over bindings in dispatch order for the current screen.
 
-        This method is used internally by the bindings system.
+        Args:
+            priority: If `True` iterate priority bindings from `App` down,
+                otherwise iterate regular bindings from the focused widget up.
+
+        Yields:
+            Tuples of (namespace node, binding).
+        """
+        chain = (
+            reversed(self.screen._binding_chain)
+            if priority
+            else self.screen._modal_binding_chain
+        )
+        for namespace, bindings in chain:
+            for key_bindings in bindings.key_to_bindings.values():
+                for binding in key_bindings:
+                    if binding.priority == priority:
+                        yield namespace, binding
+
+    def _active_bindings_signature(self) -> frozenset[tuple[object, ...]]:
+        """Build a value identifying the bindings currently available.
+
+        The signature changes whenever bindings are added, removed, rebound,
+        or the modal stack changes. It is compared against the snapshot taken
+        when a key sequence was armed, so a sequence never continues to match
+        against a different set of bindings.
+
+        Returns:
+            An opaque value to compare for equality.
+        """
+        screen = self.screen
+        items: list[tuple[object, ...]] = []
+        for chain in (
+            screen._binding_chain,
+            screen._modal_binding_chain,
+        ):
+            for namespace, bindings in chain:
+                for key, key_bindings in bindings.key_to_bindings.items():
+                    for binding in key_bindings:
+                        items.append(
+                            (id(namespace), key, binding.action, binding.priority)
+                        )
+        return frozenset(items)
+
+    def _key_sequence_context_valid(self) -> bool:
+        """Check the focused widget and active bindings have not changed."""
+        return (
+            self.focused is self._key_sequence_focused
+            and self._active_bindings_signature()
+            == self._key_sequence_signature
+        )
+
+    def _cancel_key_sequence(self) -> None:
+        """Cancel any pending key sequence.
+
+        Buffered keys are discarded. This is called on focus changes,
+        keymap updates, app blur, and explicit cancellation.
+        """
+        if self._key_sequence_timer is not None:
+            self._key_sequence_timer.stop()
+            self._key_sequence_timer = None
+        self._key_sequence = ()
+
+    def _arm_key_sequence(self, sequence: tuple[str, ...], priority: bool) -> None:
+        """Buffer the keys pressed so far, and start (or restart) the timeout.
+
+        Args:
+            sequence: The key presses pressed so far.
+            priority: Whether the sequence is being matched in the priority phase.
+        """
+        if self._key_sequence_timer is not None:
+            self._key_sequence_timer.stop()
+        self._key_sequence = sequence
+        self._key_sequence_priority = priority
+        self._key_sequence_focused = self.focused
+        self._key_sequence_signature = self._active_bindings_signature()
+        self._key_sequence_timer = self.set_timer(
+            self.KEY_SEQUENCE_TIMEOUT,
+            self._key_sequence_timed_out,
+        )
+
+    def _replay_keys(self, keys: tuple[str, ...]) -> None:
+        """Re-dispatch buffered keys as ordinary key presses.
+
+        Replayed keys are matched only against complete, single-press bindings,
+        so they can never start a new sequence -- which guarantees that
+        ordinary input is never swallowed.
+
+        Args:
+            keys: The keys to replay, in the order they were originally pressed.
+        """
+        for key in keys:
+            self.post_message(_ReplayedKey(key, key_to_character(key)))
+
+    async def _release_sequence_keys(
+        self, keys: tuple[str, ...], *, priority: bool
+    ) -> None:
+        """Release buffered keys after a sequence ends without firing.
+
+        Sequences armed in the priority phase withhold every key from the
+        focused widget, so all keys are replayed as ordinary presses.
+
+        The first key of a sequence armed in the regular phase was already
+        forwarded to the focused widget before it bubbled to the app and
+        armed the sequence. Re-sending it would duplicate ordinary input
+        (e.g. an extra character in an `Input`), so only its bindings are
+        retried; every subsequent key (which was withheld) is replayed.
+
+        Args:
+            keys: The buffered keys, optionally followed by the key that
+                ended the sequence.
+            priority: The dispatch phase the sequence was armed in.
+        """
+        if not keys:
+            return
+        if priority:
+            self._replay_keys(keys)
+        else:
+            arming_key, *remaining = keys
+            await self._check_exact_bindings(arming_key, False)
+            self._replay_keys(tuple(remaining))
+
+    async def _key_sequence_timed_out(self) -> None:
+        """Invoked when no further key presses arrive within the timeout."""
+        self._key_sequence_timer = None
+        sequence = self._key_sequence
+        priority = self._key_sequence_priority
+        self._key_sequence = ()
+        if not sequence:
+            return
+        # If focus moved or the bindings changed since arming, the sequence
+        # is stale: discard it without firing anything.
+        if not self._key_sequence_context_valid():
+            return
+        # Re-validate against the bindings that are active *now*.
+        for namespace, binding in self._iter_binding_candidates(priority):
+            if binding.key_sequence == sequence and await self.run_action(
+                binding.action, namespace
+            ):
+                return
+        # No complete binding for the buffered keys: release them as input.
+        await self._release_sequence_keys(sequence, priority=priority)
+
+    async def _check_exact_bindings(self, key: str, priority: bool = False) -> bool:
+        """Check a key against complete bindings only.
+
+        Key sequences are not considered; this is used for ordinary key
+        presses (when no sequence is pending) and for replayed keys.
 
         Args:
             key: A key.
@@ -3985,6 +4189,93 @@ class App(Generic[ReturnType], DOMNode):
                 if binding.priority == priority:
                     if await self.run_action(binding.action, namespace):
                         return True
+        return False
+
+    async def _check_bindings(
+        self, key: str, priority: bool = False, *, replay: bool = False
+    ) -> bool:
+        """Handle a key press, including key sequences.
+
+        This method is used internally by the bindings system.
+
+        Args:
+            key: A key.
+            priority: If `True` check from `App` down, otherwise from focused up.
+            replay: If `True`, the key is a replayed press from an abandoned
+                sequence -- only match complete bindings, never start a sequence.
+
+        Returns:
+            True if the key was handled (or buffered) by a binding, otherwise False
+        """
+        if replay:
+            return await self._check_exact_bindings(key, priority)
+
+        # If focus moved or the bindings changed while a sequence was
+        # pending, the buffered presses are stale. Discard them and match
+        # this key from scratch (which keeps behaviour deterministic).
+        if self._key_sequence and not self._key_sequence_context_valid():
+            self._cancel_key_sequence()
+
+        # A pending sequence may have been armed in the other dispatch
+        # phase (the priority phase always runs first). Keep matching it
+        # against the chain it was armed with.
+        effective_priority = (
+            self._key_sequence_priority if self._key_sequence else priority
+        )
+
+        pressed = (*self._key_sequence, key)
+
+        exact: list[tuple[DOMNode, Binding]] = []
+        prefixes: list[tuple[DOMNode, Binding]] = []
+        for namespace, binding in self._iter_binding_candidates(effective_priority):
+            binding_sequence = binding.key_sequence
+            if binding_sequence == pressed:
+                exact.append((namespace, binding))
+            elif (
+                len(binding_sequence) > len(pressed)
+                and binding_sequence[: len(pressed)] == pressed
+            ):
+                prefixes.append((namespace, binding))
+
+        if exact and not prefixes:
+            # Complete match with no longer sequence sharing this prefix:
+            # dispatch immediately.
+            buffered = self._key_sequence
+            buffered_priority = self._key_sequence_priority
+            self._cancel_key_sequence()
+            for namespace, binding in exact:
+                if await self.run_action(binding.action, namespace):
+                    return True
+            # The action declined to handle the complete match. Re-dispatch
+            # everything as ordinary input so nothing is swallowed.
+            if buffered:
+                await self._release_sequence_keys(
+                    (*buffered, key), priority=buffered_priority
+                )
+                return True
+            return False
+
+        if prefixes:
+            # A longer key sequence shares this prefix. Longer sequences take
+            # priority: buffer the press and wait for the timeout / next key.
+            self._arm_key_sequence(pressed, effective_priority)
+            return True
+
+        # Nothing completes or continues the pressed sequence.
+        if self._key_sequence:
+            buffered = self._key_sequence
+            buffered_priority = self._key_sequence_priority
+            self._cancel_key_sequence()
+            if key == "escape":
+                # Escape explicitly cancels the pending sequence.
+                return True
+            # An unrelated key breaks the sequence: release the buffered keys
+            # (followed by the current key) as ordinary input.
+            await self._release_sequence_keys(
+                (*buffered, key), priority=buffered_priority
+            )
+            return True
+
         return False
 
     def action_help_quit(self) -> None:
@@ -4133,7 +4424,11 @@ class App(Generic[ReturnType], DOMNode):
                         self.screen._clear_tooltip()
                     except NoScreen:
                         pass
-                if not await self._check_bindings(event.key, priority=True):
+                if not await self._check_bindings(
+                    event.key,
+                    priority=True,
+                    replay=isinstance(event, _ReplayedKey),
+                ):
                     forward_target = self.focused or self.screen
                     forward_target._forward_event(event)
             else:
@@ -4339,7 +4634,11 @@ class App(Generic[ReturnType], DOMNode):
         message.stop()
 
     async def _on_key(self, event: events.Key) -> None:
-        if not (await self._check_bindings(event.key)):
+        if not (
+            await self._check_bindings(
+                event.key, replay=isinstance(event, _ReplayedKey)
+            )
+        ):
             await dispatch_key(self, event)
 
     async def _on_resize(self, event: events.Resize) -> None:
@@ -4365,6 +4664,8 @@ class App(Generic[ReturnType], DOMNode):
         """App has lost focus."""
         # Required by textual-web to manage focus in a web page.
         self.app_focus = False
+        # A key sequence can't continue once the app loses focus.
+        self._cancel_key_sequence()
         self.screen.refresh_bindings()
 
     def _prune(self, *nodes: Widget, parent: DOMNode | None = None) -> AwaitRemove:

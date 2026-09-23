@@ -359,10 +359,15 @@ def _character_to_key(character: str) -> str:
 def _normalize_key_list(keys: str) -> str:
     """Normalizes a comma separated list of keys.
 
-    Replaces single letter keys with full name.
+    Replaces single letter keys with full name. Whitespace within an
+    alias denotes a key sequence (keys pressed one after another).
     """
 
-    keys_list = [key.strip() for key in keys.split(",")]
-    return ",".join(
-        _character_to_key(key) if len(key) == 1 else key for key in keys_list
-    )
+    aliases: list[str] = []
+    for alias in keys.split(","):
+        sequence = [
+            _character_to_key(key) if len(key) == 1 else key
+            for key in alias.split()
+        ]
+        aliases.append(" ".join(sequence))
+    return ",".join(aliases)
