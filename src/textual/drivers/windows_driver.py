@@ -53,6 +53,28 @@ class WindowsDriver(Driver):
         assert self._writer_thread is not None, "Driver must be in application mode"
         self._writer_thread.write(data)
 
+    def write_frame(self, data: str) -> asyncio.Future[bool]:
+        """Write a complete frame to the output device.
+
+        Args:
+            data: Raw data containing a complete frame.
+
+        Returns:
+            A future resolving when the frame actually reaches the device.
+        """
+        assert self._writer_thread is not None, "Driver must be in application mode"
+        frame_future = self._writer_thread.write_frame(data)
+        assert frame_future is not None
+        return frame_future
+
+    def _on_writer_error(self, error: BaseException) -> None:
+        """Called (in the writer thread) if writing to the device failed.
+
+        Args:
+            error: The exception raised while writing.
+        """
+        self._app.call_later(self._app._handle_exception, error)
+
     def _enable_mouse_support(self) -> None:
         """Enable reporting of mouse events."""
         if not self._mouse:
@@ -89,7 +111,11 @@ class WindowsDriver(Driver):
 
         self._restore_console = win32.enable_application_mode()
 
-        self._writer_thread = WriterThread(self._file)
+        self._writer_thread = WriterThread(
+            self._file,
+            loop=loop,
+            on_error=self._on_writer_error,
+        )
         self._writer_thread.start()
 
         self.write("\x1b[?1049h")  # Enable alt screen

@@ -134,6 +134,7 @@ from textual.worker import NoActiveWorker, get_current_worker
 from textual.worker_manager import WorkerManager
 
 if TYPE_CHECKING:
+    from textual.message_pump import MessagePump
     from textual_dev.client import DevtoolsClient
     from typing_extensions import Coroutine, Literal, Self, TypeAlias
 
@@ -3825,72 +3826,101 @@ class App(Generic[ReturnType], DOMNode):
             screen: Screen instance
             renderable: A Rich renderable.
         """
-
-        try:
-            if renderable is None:
-                return
-            if self._batch_count:
-                return
-            if (
-                self._running
-                and not self._closed
-                and not self.is_headless
-                and self._driver is not None
-            ):
-                console = self.console
-                self._begin_update()
-                try:
-                    try:
-                        if isinstance(renderable, CompositorUpdate):
-                            cursor_position = self.screen.outer_size.clamp_offset(
-                                self.cursor_position
-                            )
-                            if self._driver.is_inline:
-                                terminal_sequence = Control.move(
-                                    *(-self._previous_cursor_position)
-                                ).segment.text
-                                terminal_sequence += renderable.render_segments(console)
-                                terminal_sequence += Control.move(
-                                    *cursor_position
-                                ).segment.text
-                            else:
-                                terminal_sequence = renderable.render_segments(console)
-                                terminal_sequence += Control.move_to(
-                                    *cursor_position
-                                ).segment.text
-                            self._previous_cursor_position = cursor_position
-                        else:
-                            segments = console.render(renderable)
-                            terminal_sequence = console._render_buffer(segments)
-                    except Exception as error:
-                        self._handle_exception(error)
-                    else:
-                        if WINDOWS:
-                            # Combat a problem with Python on Windows.
-                            #
-                            # https://github.com/Textualize/textual/issues/2548
-                            # https://github.com/python/cpython/issues/82052
-                            CHUNK_SIZE = 8192
-                            write = self._driver.write
-                            for chunk in (
-                                terminal_sequence[offset : offset + CHUNK_SIZE]
-                                for offset in range(
-                                    0, len(terminal_sequence), CHUNK_SIZE
-                                )
-                            ):
-                                write(chunk)
-                        else:
-                            self._driver.write(terminal_sequence)
-                finally:
-                    self._end_update()
-
-                self._driver.flush()
-
-        finally:
+        if renderable is None or self._batch_count:
             self.post_display_hook()
+            return
+        if not (
+            self._running
+            and not self._closed
+            and not self.is_headless
+            and self._driver is not None
+        ):
+            self.post_display_hook()
+            return
+
+        console = self.console
+        self._begin_update()
+        try:
+            try:
+                if isinstance(renderable, CompositorUpdate):
+                    cursor_position = self.screen.outer_size.clamp_offset(
+                        self.cursor_position
+                    )
+                    if self._driver.is_inline:
+                        terminal_sequence = Control.move(
+                            *(-self._previous_cursor_position)
+                        ).segment.text
+                        terminal_sequence += renderable.render_segments(console)
+                        terminal_sequence += Control.move(
+                            *cursor_position
+                        ).segment.text
+                    else:
+                        terminal_sequence = renderable.render_segments(console)
+                        terminal_sequence += Control.move_to(
+                            *cursor_position
+                        ).segment.text
+                    self._previous_cursor_position = cursor_position
+                else:
+                    segments = console.render(renderable)
+                    terminal_sequence = console._render_buffer(segments)
+            except Exception as error:
+                self._handle_exception(error)
+                self.post_display_hook()
+                return
+        finally:
+            self._end_update()
+
+        # Snapshot the after-refresh callbacks so they are invoked once this
+        # exact frame has actually reached the output device, rather than when
+        # it was merely enqueued.
+        frame_callbacks = screen._take_callbacks()
+        frame_future = self._driver.write_frame(terminal_sequence)
+        frame_future.add_done_callback(
+            partial(self._frame_delivered, frame_callbacks)
+        )
+        self._driver.flush()
 
     def post_display_hook(self) -> None:
         """Called immediately after a display is done. Used in tests."""
+
+    def _frame_delivered(
+        self,
+        frame_callbacks: list[tuple[CallbackType, MessagePump]],
+        future: asyncio.Future[bool],
+    ) -> None:
+        """Called on the event loop when a frame has reached the output device.
+
+        Args:
+            frame_callbacks: After-refresh callbacks attached to this frame.
+            future: The frame delivery future.
+        """
+        try:
+            delivered = not future.cancelled() and future.result()
+        except Exception:
+            delivered = False
+        if not delivered:
+            # The frame was dropped without being displayed; do not claim a
+            # display happened. Callbacks will run with a newer frame (or not
+            # at all, during shutdown).
+            return
+
+        self.post_display_hook()
+        if frame_callbacks:
+            create_task(self._invoke_frame_callbacks(frame_callbacks))
+
+    @staticmethod
+    async def _invoke_frame_callbacks(
+        frame_callbacks: list[tuple[CallbackType, MessagePump]],
+    ) -> None:
+        """Invoke after-refresh callbacks in their sender's context.
+
+        Args:
+            frame_callbacks: Pairs of callback and the message pump that owns
+                its context.
+        """
+        for callback, message_pump in frame_callbacks:
+            with message_pump._context():
+                await invoke(callback)
 
     def get_widget_at(self, x: int, y: int) -> tuple[Widget, Region]:
         """Get the widget under the given coordinates.

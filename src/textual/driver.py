@@ -139,6 +139,28 @@ class Driver(ABC):
             data: Raw data.
         """
 
+    def write_frame(self, data: str) -> asyncio.Future[bool]:
+        """Write a complete frame to the output device.
+
+        Unlike [`write`][textual.driver.Driver.write], drivers may coalesce
+        pending frames, so that only the latest complete frame is delivered to
+        a slow output device.
+
+        Args:
+            data: Raw data containing a complete frame.
+
+        Returns:
+            A future which resolves to `True` once the frame (or a newer frame
+            it was coalesced into) has actually reached the output device, or
+            `False` if the frame was dropped without being displayed.
+        """
+        # Default implementation is synchronous: the frame is delivered
+        # immediately. Drivers with a background writer override this.
+        self.write(data)
+        future: asyncio.Future[bool] = self._loop.create_future()
+        future.set_result(True)
+        return future
+
     def flush(self) -> None:
         """Flush any buffered data."""
 

@@ -193,6 +193,30 @@ class LinuxDriver(Driver):
         assert self._writer_thread is not None, "Driver must be in application mode"
         self._writer_thread.write(data)
 
+    def write_frame(self, data: str) -> asyncio.Future[bool]:
+        """Write a complete frame to the output device.
+
+        Args:
+            data: Raw data containing a complete frame.
+
+        Returns:
+            A future resolving when the frame actually reaches the device.
+        """
+        assert self._writer_thread is not None, "Driver must be in application mode"
+        frame_future = self._writer_thread.write_frame(data)
+        assert frame_future is not None
+        return frame_future
+
+    def _on_writer_error(self, error: BaseException) -> None:
+        """Called (in the writer thread) if writing to the device failed.
+
+        Args:
+            error: The exception raised while writing.
+        """
+        # Surface the error on the app's event loop. Handling it always exits
+        # the app, and the dead writer's stop() joins immediately.
+        self._app.call_later(self._app._handle_exception, error)
+
     def start_application_mode(self):
         """Start application mode."""
 
@@ -240,7 +264,11 @@ class LinuxDriver(Driver):
                 loop=loop,
             )
 
-        self._writer_thread = WriterThread(self._file)
+        self._writer_thread = WriterThread(
+            self._file,
+            loop=loop,
+            on_error=self._on_writer_error,
+        )
         self._writer_thread.start()
 
         def on_terminal_resize(signum, stack) -> None:

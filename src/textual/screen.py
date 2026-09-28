@@ -1261,15 +1261,35 @@ class Screen(Generic[ScreenResultType], Widget):
         if self._callbacks:
             self.call_next(self._invoke_and_clear_callbacks)
 
+    def _take_callbacks(self) -> list[tuple[CallbackType, MessagePump]]:
+        """Remove and return all pending after-refresh callbacks.
+
+        Returns:
+            The callbacks that were pending.
+        """
+        callbacks = self._callbacks[:]
+        self._callbacks.clear()
+        return callbacks
+
     async def _invoke_and_clear_callbacks(self) -> None:
         """If there are scheduled callbacks to run, call them and clear
         the callback queue."""
         if self._callbacks:
-            callbacks = self._callbacks[:]
-            self._callbacks.clear()
-            for callback, message_pump in callbacks:
-                with message_pump._context():
-                    await invoke(callback)
+            callbacks = self._take_callbacks()
+            await self._invoke_callbacks(callbacks)
+
+    @staticmethod
+    async def _invoke_callbacks(
+        callbacks: list[tuple[CallbackType, MessagePump]],
+    ) -> None:
+        """Invoke callbacks in their sender's context.
+
+        Args:
+            callbacks: Pairs of callback and the message pump owning its context.
+        """
+        for callback, message_pump in callbacks:
+            with message_pump._context():
+                await invoke(callback)
 
     def _invoke_later(self, callback: CallbackType, sender: MessagePump) -> None:
         """Enqueue a callback to be invoked after the screen is repainted.
