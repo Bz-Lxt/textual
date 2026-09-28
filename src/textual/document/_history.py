@@ -3,6 +3,7 @@ from __future__ import annotations
 import time
 from collections import deque
 from dataclasses import dataclass, field
+from typing import Sequence
 
 from textual.document._edit import Edit
 
@@ -115,6 +116,78 @@ class EditHistory:
         # For some edits, we want to ensure the NEXT edit cannot be added to its batch,
         # so enforce a checkpoint now.
         if contains_newline or edit_characters > 1:
+            self.checkpoint()
+
+    def record_many(self, edits: Sequence[Edit]) -> None:
+        """Record a group of Edits which together form a single undoable action.
+
+        This is used when one user action (e.g. typing with multiple cursors)
+        results in more than one edit to the document. All the edits in the
+        group are recorded in a single batch, so undoing and redoing restores
+        all the edits atomically.
+
+        The batching rules applied to the group are the same as those applied
+        to a single edit in `record`, using the aggregate number of inserted
+        characters and considering the whole group a replacement if any single
+        edit replaces text.
+
+        Args:
+            edits: The edits to record, in chronological (document) order. Each
+                edit must already have been performed using `Edit.do`.
+        """
+        effective_edits = [
+            edit
+            for edit in edits
+            if not (edit.text == "" and edit._edit_result.replaced_text == "")
+        ]
+        if not effective_edits:
+            return
+
+        for edit in effective_edits:
+            if edit._edit_result is None:
+                raise HistoryException(
+                    "Cannot add an edit to history before it has been performed "
+                    "using `Edit.do`."
+                )
+
+        undo_stack = self._undo_stack
+        current_time = self._get_time()
+        edit_characters = sum(len(edit.text) for edit in effective_edits)
+        is_replacement = any(
+            bool(edit._edit_result.replaced_text) for edit in effective_edits
+        )
+        contains_newline = any(
+            "\n" in edit.text or "\n" in edit._edit_result.replaced_text
+            for edit in effective_edits
+        )
+        multi_character_edit = any(len(edit.text) > 1 for edit in effective_edits)
+
+        if (
+            not undo_stack
+            or self._force_end_batch
+            or multi_character_edit
+            or contains_newline
+            or is_replacement != self._previously_replaced
+            or current_time - self._last_edit_time > self.checkpoint_timer
+            or self._character_count + edit_characters > self.checkpoint_max_characters
+        ):
+            # Create a new batch (creating a "checkpoint") containing the whole group.
+            undo_stack.append(list(effective_edits))
+            self._character_count = edit_characters
+            self._last_edit_time = current_time
+            self._force_end_batch = False
+        else:
+            # Add the whole group to the most recent batch.
+            undo_stack[-1].extend(effective_edits)
+            self._character_count += edit_characters
+            self._last_edit_time = current_time
+
+        self._previously_replaced = is_replacement
+        self._redo_stack.clear()
+
+        # For some edits, we want to ensure the NEXT edit cannot be added to this
+        # batch, so enforce a checkpoint now.
+        if contains_newline or multi_character_edit:
             self.checkpoint()
 
     def _pop_undo(self) -> list[Edit] | None:

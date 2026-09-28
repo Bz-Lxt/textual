@@ -6,7 +6,7 @@ from collections import defaultdict
 from dataclasses import dataclass
 from functools import lru_cache
 from pathlib import Path
-from typing import TYPE_CHECKING, ClassVar, Iterable, Optional, Sequence, Tuple
+from typing import TYPE_CHECKING, Callable, ClassVar, Iterable, Optional, Sequence, Tuple
 
 from rich.console import RenderableType
 from rich.segment import Segment
@@ -346,6 +346,19 @@ TextArea {
             "Select all",
             show=False,
         ),
+        # Multiple cursors
+        Binding(
+            "ctrl+alt+down",
+            "add_cursor_below",
+            "Add cursor below",
+            show=False,
+        ),
+        Binding(
+            "ctrl+alt+up",
+            "add_cursor_above",
+            "Add cursor above",
+            show=False,
+        ),
         # Deletion
         Binding(
             "backspace",
@@ -450,6 +463,9 @@ TextArea {
     | ctrl+k                 | Delete from cursor to the end of the line.   |
     | f6                     | Select the current line.                     |
     | f7                     | Select all text in the document.             |
+    | ctrl+alt+up            | Add an additional cursor on the line above.  |
+    | ctrl+alt+down          | Add an additional cursor on the line below.  |
+    | escape                 | Collapse multiple cursors to the primary cursor. |
     | ctrl+z,super+z         | Undo.                                        |
     | ctrl+y,super+y         | Redo.                                        |
     | ctrl+x,super+x         | Cut selection or line if no selection.       |
@@ -479,9 +495,12 @@ TextArea {
     selection: Reactive[Selection] = reactive(
         Selection(), init=False, always_update=True
     )
-    """The selection start and end locations (zero-based line_index, offset).
+    """The primary selection start and end locations (zero-based line_index, offset).
 
-    This represents the cursor location and the current selection.
+    This represents the primary cursor location and its current selection. When
+    multiple selections are active (see [`selections`][textual.widgets.TextArea.selections]),
+    this refers to the primary selection; assigning to this attribute collapses all
+    other selections.
 
     The `Selection.end` always refers to the cursor location.
 
@@ -653,6 +672,16 @@ TextArea {
 
         self._selecting = False
         """True if we're currently selecting text using the mouse, otherwise False."""
+
+        self._selections: tuple[Selection, ...] = (Selection(),)
+        """All of the active selections, in document order. The last one is not
+        necessarily the primary selection; `TextArea.selection` always refers to the
+        primary selection (where new edits originate from)."""
+
+        self._selection_sync: bool = False
+        """Guard used while syncing the primary `selection` reactive with
+        `_selections`, to avoid collapsing multiple selections when the reactive
+        is updated internally."""
 
         self._matching_bracket_location: Location | None = None
         """The location (row, column) of the bracket which matches the bracket the
@@ -866,6 +895,12 @@ TextArea {
         self, previous_selection: Selection, selection: Selection
     ) -> None:
         """When the cursor moves, scroll it into view."""
+        # If the primary `selection` reactive was assigned directly (rather than
+        # via the multi-selection API), then editing collapses down to a single
+        # selection.
+        if not self._selection_sync:
+            self._selections = (selection,)
+
         # Find the visual offset of the cursor in the document
 
         if not self.is_mounted:
@@ -1219,6 +1254,9 @@ TextArea {
 
     def _watch_soft_wrap(self) -> None:
         self._rewrap_and_refresh_virtual_size()
+        # Re-wrapping is a logical break in editing, so subsequent edits start a
+        # new undo batch.
+        self.history.checkpoint()
         self.call_after_refresh(self.scroll_cursor_visible, center=True)
 
     @property
@@ -1363,25 +1401,28 @@ TextArea {
 
         scroll_x, scroll_y = self.scroll_offset
         absolute_y = scroll_y + y
-        selection = self.selection
+        selections = self.selections
         _, cursor_y = self._cursor_offset
         cache_key = (
             self.size,
             scroll_x,
             absolute_y,
-            (
+            # All selections which may affect this rendered line.
+            tuple(
                 selection
                 if selection.contains_line(absolute_y) or self.soft_wrap
                 else selection.end[0] == absolute_y
+                for selection in selections
             ),
-            (
-                selection.end
-                if (
-                    self._cursor_visible
-                    and self.cursor_blink
-                    and absolute_y == cursor_y
-                )
-                else None
+            # The columns of any cursors (empty selections) resting on this line
+            # which are visible during the current blink phase.
+            tuple(
+                selection.end[1]
+                for selection in selections
+                if self._cursor_visible
+                and self.cursor_blink
+                and selection.is_empty
+                and selection.end[0] == absolute_y
             ),
             self.theme,
             self._matching_bracket_location,
@@ -1447,10 +1488,6 @@ TextArea {
         start, end = selection
         cursor_row, cursor_column = end
 
-        selection_top, selection_bottom = sorted(selection)
-        selection_top_row, selection_top_column = selection_top
-        selection_bottom_row, selection_bottom_column = selection_bottom
-
         highlight_cursor_line = self.highlight_cursor_line and self._has_cursor
         cursor_line_style = (
             theme.cursor_line_style if (theme and highlight_cursor_line) else None
@@ -1460,36 +1497,44 @@ TextArea {
         if has_cursor and cursor_line_style and cursor_row == line_index:
             line.stylize(cursor_line_style)
 
-        # Selection styling
-        if start != end and selection_top_row <= line_index <= selection_bottom_row:
-            # If this row intersects with the selection range
-            selection_style = theme.selection_style if theme else None
-            cursor_row, _ = end
-            if selection_style:
-                if line_character_count == 0 and line_index != cursor_row:
+        # Selection styling - iterate over every active selection so that
+        # multiple selections are all highlighted.
+        selection_style = theme.selection_style if theme else None
+        if selection_style:
+            for current_selection in self.selections:
+                sel_start, sel_end = current_selection
+                if sel_start == sel_end:
+                    # An empty selection is just a cursor; nothing to highlight.
+                    continue
+                selection_top, selection_bottom = sorted(current_selection)
+                selection_top_row, selection_top_column = selection_top
+                selection_bottom_row, selection_bottom_column = selection_bottom
+                if not selection_top_row <= line_index <= selection_bottom_row:
+                    continue
+                # This row intersects with the selection range.
+                if line_character_count == 0 and line_index != sel_end[0]:
                     # A simple highlight to show empty lines are included in the selection
                     line.plain = "▌"
                     line.stylize(Style(color=selection_style.bgcolor))
+                elif line_index == selection_top_row == selection_bottom_row:
+                    # Selection within a single line
+                    line.stylize(
+                        selection_style,
+                        start=selection_top_column,
+                        end=selection_bottom_column,
+                    )
                 else:
-                    if line_index == selection_top_row == selection_bottom_row:
-                        # Selection within a single line
+                    # Selection spanning multiple lines
+                    if line_index == selection_top_row:
                         line.stylize(
                             selection_style,
                             start=selection_top_column,
-                            end=selection_bottom_column,
+                            end=line_character_count,
                         )
+                    elif line_index == selection_bottom_row:
+                        line.stylize(selection_style, end=selection_bottom_column)
                     else:
-                        # Selection spanning multiple lines
-                        if line_index == selection_top_row:
-                            line.stylize(
-                                selection_style,
-                                start=selection_top_column,
-                                end=line_character_count,
-                            )
-                        elif line_index == selection_bottom_row:
-                            line.stylize(selection_style, end=selection_bottom_column)
-                        else:
-                            line.stylize(selection_style, end=line_character_count)
+                        line.stylize(selection_style, end=line_character_count)
 
         highlights = self._highlights
         if highlights and theme:
@@ -1517,7 +1562,6 @@ TextArea {
         )
 
         if cursor_row == line_index:
-            draw_cursor = self._draw_cursor
             if draw_matched_brackets:
                 matching_bracket_style = theme.bracket_matching_style if theme else None
                 if matching_bracket_style:
@@ -1537,10 +1581,18 @@ TextArea {
                     line[cursor_column:],
                 )
 
-            if draw_cursor:
-                cursor_style = theme.cursor_style if theme else None
-                if cursor_style:
-                    line.stylize(cursor_style, cursor_column, cursor_column + 1)
+        if self._draw_cursor:
+            # Draw a cursor block at every empty selection resting on this line,
+            # including the primary cursor and any additional multiple cursors.
+            cursor_style = theme.cursor_style if theme else None
+            if cursor_style:
+                for current_selection in self.selections:
+                    if (
+                        current_selection.is_empty
+                        and current_selection.end[0] == line_index
+                    ):
+                        column = current_selection.end[1]
+                        line.stylize(cursor_style, column, column + 1)
 
         # Highlight the partner opening/closing bracket.
         if draw_matched_brackets:
@@ -1703,6 +1755,197 @@ TextArea {
         self._refresh_size()
         return result
 
+    def _replace_ranges(
+        self,
+        insert: str,
+        ranges: Iterable[tuple[Location, Location]],
+        cursor_locations: Sequence[Location] | None = None,
+    ) -> list[EditResult] | None:
+        """Replace the text at a number of ranges with the same text.
+
+        This is the core of multi-cursor editing: one user action results in an
+        edit at every active selection/cursor. Overlapping ranges are merged so
+        their content is only replaced once. Edits are applied from the bottom of
+        the document upwards so locations earlier in the document remain valid,
+        and the whole group is recorded as a single undoable batch.
+
+        Does nothing in read-only mode.
+
+        Args:
+            insert: The text to insert in place of the text at each range.
+            ranges: The ranges to replace (start and end locations, in any order).
+            cursor_locations: Optional final cursor locations, aligned with
+                `ranges` after merging. If not supplied, each cursor rests at the
+                end of its edit.
+
+        Returns:
+            An `EditResult` per applied edit (in document order), or `None` if the
+            operation was rejected (read-only mode or no ranges were supplied).
+        """
+        if self.read_only:
+            return None
+
+        # Normalise ranges to document-order intervals.
+        intervals = sorted(
+            (min(start, end), max(start, end)) for start, end in ranges
+        )
+        if not intervals:
+            return None
+
+        # Merge overlapping/contacting intervals so a piece of text is never
+        # replaced twice.
+        merged_ranges: list[tuple[Location, Location]] = []
+        for top, bottom in intervals:
+            if merged_ranges and top <= merged_ranges[-1][1]:
+                merged_ranges[-1] = (merged_ranges[-1][0], max(merged_ranges[-1][1], bottom))
+            else:
+                merged_ranges.append((top, bottom))
+
+        edits = [
+            Edit(insert, top, bottom, maintain_selection_offset=False)
+            for top, bottom in merged_ranges
+        ]
+        if cursor_locations is not None:
+            return self._apply_edits(edits, cursor_locations=cursor_locations)
+        return self._apply_edits(edits)
+
+    def _apply_edits(
+        self,
+        edits: list[Edit],
+        cursor_locations: Sequence[Location] | None = None,
+    ) -> list[EditResult] | None:
+        """Apply a group of edits simultaneously as a single user action.
+
+        See `_replace_ranges` for the semantics.
+
+        Args:
+            edits: The edits to apply, in document order.
+            cursor_locations: Optional final cursor locations aligned with
+                `edits`. If not supplied, each cursor rests at the end of its edit.
+
+        Returns:
+            An `EditResult` per edit, in document order, or `None` if there were
+            no edits to apply.
+        """
+        if not edits:
+            return None
+
+        if any(len(edit.text) > 1 for edit in edits):
+            self._restart_blink()
+
+        # Keep the suggestion in sync (mirrors `TextArea.edit`).
+        insert_text = edits[0].text
+        if all(edit.text == insert_text for edit in edits):
+            if self.suggestion.startswith(insert_text):
+                self.suggestion = self.suggestion[len(insert_text) :]
+            else:
+                self.suggestion = ""
+
+        original_selections = self.selections
+        original_primary = self.selection
+        primary_point = original_primary.end
+
+        old_gutter_width = self.gutter_width
+        minimum_top = min(edit.top for edit in edits)
+        maximum_old_bottom = max(edit.bottom for edit in edits)
+
+        # Apply the edits from the bottom of the document upwards so that the
+        # locations of edits earlier in the document remain valid.
+        results: list[EditResult] = []
+        for edit in reversed(edits):
+            results.append(edit.do(self, record_selection=False))
+        results.reverse()
+
+        # Record the selection state required to undo/redo the whole group.
+        primary_edit_index = 0
+        for index, edit in enumerate(edits):
+            edit._original_selection = original_primary
+            edit._original_selections = original_selections
+            if edit.top <= primary_point <= edit.bottom:
+                primary_edit_index = index
+        edits[primary_edit_index]._primary_edit = True
+
+        # After a keyboard edit, a cursor rests at the end of each edit (or at
+        # the caller-provided final cursor locations).
+        final_locations = (
+            list(cursor_locations)
+            if cursor_locations is not None
+            else [result.end_location for result in results]
+        )
+        updated_cursors = [
+            Selection.cursor(location) for location in final_locations
+        ]
+        primary_end = final_locations[primary_edit_index]
+        normalized, primary_selection = self._normalize_selections(
+            updated_cursors, primary=primary_end
+        )
+        for edit in edits:
+            edit._updated_selections = normalized
+            edit._updated_selection = primary_selection
+            edit._restore_selections = normalized
+            edit._restore_selection = primary_selection
+
+        new_gutter_width = self.gutter_width
+        if old_gutter_width != new_gutter_width:
+            self.wrapped_document.wrap(self.wrap_width, self.indent_width)
+        else:
+            # Re-wrap the single span covering all the edits. Lines between the
+            # disjoint edits are re-wrapped identically, and the aggregate line
+            # shift keeps lines below the span consistent.
+            self.wrapped_document.wrap_range(
+                minimum_top,
+                maximum_old_bottom,
+                max(result.end_location for result in results),
+            )
+
+        self._apply_selections(normalized, primary_selection)
+        for edit in edits:
+            edit.after(self)
+        self.history.record_many(edits)
+        self._build_highlight_map()
+        self.post_message(self.Changed(self))
+        self.update_suggestion()
+        self._refresh_size()
+        return results
+
+    def _insert_at_all_selections(self, text: str) -> list[EditResult] | None:
+        """Insert the same text at every active selection, replacing selected text.
+
+        Args:
+            text: The text to insert at each selection.
+
+        Returns:
+            The results of the edits, or `None` if the operation was rejected.
+        """
+        if self.read_only:
+            return None
+        ranges = [
+            (selection.start, selection.end) for selection in self.selections
+        ]
+        return self._replace_ranges(text, ranges)
+
+    def _delete_at_all_selections(
+        self, get_range: Callable[[Selection], tuple[Location, Location]]
+    ) -> list[EditResult] | None:
+        """Delete text at every active selection using the same range rule.
+
+        The `get_range` callback is applied to each active selection to find the
+        span of text to delete. All the deletions are applied simultaneously and
+        recorded as a single undoable batch.
+
+        Does nothing in read-only mode.
+
+        Args:
+            get_range: Given a selection, return the range of text to delete.
+
+        Returns:
+            An `EditResult` per applied edit, or `None` in read-only mode.
+        """
+        if self.read_only:
+            return None
+        ranges = [get_range(selection) for selection in self.selections]
+        return self._replace_ranges("", ranges)
+
     def undo(self) -> None:
         """Undo the edits since the last checkpoint (the most recent batch of edits)."""
         if edits := self.history._pop_undo():
@@ -1787,6 +2030,8 @@ TextArea {
         maximum_old_bottom = (0, 0)
         maximum_new_bottom = (0, 0)
         for edit in edits:
+            # `record_selection=False` reuses the selection state recorded when
+            # the edit was first performed, including multiple cursors.
             edit.do(self, record_selection=False)
             end_location = (
                 edit._edit_result.end_location if edit._edit_result else (0, 0)
@@ -1820,10 +2065,21 @@ TextArea {
 
         self._restart_blink()
 
+        key = event.key
+
+        if key == "escape" and len(self.selections) > 1:
+            # Escape collapses multiple cursors back down to the primary cursor.
+            event.stop()
+            event.prevent_default()
+            self._set_selections(
+                Selection.cursor(self.selection.end),
+                primary=self.selection.end,
+            )
+            return
+
         if self.read_only:
             return
 
-        key = event.key
         insert_values = {
             "enter": "\n",
         }
@@ -1845,8 +2101,9 @@ TextArea {
             # `insert` is not None because event.character cannot be
             # None because we've checked that it's printable.
             assert insert is not None
-            start, end = self.selection
-            self._replace_via_keyboard(insert, start, end)
+            # Insert at every active selection/cursor. When there is only one
+            # selection, this is equivalent to replacing the selected text.
+            self._insert_at_all_selections(insert)
 
     def _find_columns_to_next_tab_stop(self) -> int:
         """Get the location of the next tab stop after the cursors position on the current line.
@@ -1924,13 +2181,23 @@ TextArea {
             return
 
         self._cursor_visible = not self._cursor_visible
-        _, cursor_y = self._cursor_offset
-        self.refresh_lines(cursor_y)
+        self._refresh_cursor_lines()
 
     def _watch__cursor_visible(self) -> None:
         """When the cursor visibility is toggled, ensure the row is refreshed."""
-        _, cursor_y = self._cursor_offset
-        self.refresh_lines(cursor_y)
+        self._refresh_cursor_lines()
+
+    def _refresh_cursor_lines(self) -> None:
+        """Refresh every line which currently hosts a cursor."""
+        if not self.is_mounted:
+            return
+        wrapped_document = self.wrapped_document
+        cursor_ys = {
+            wrapped_document.location_to_offset(selection.end)[1]
+            for selection in self.selections
+        }
+        for cursor_y in cursor_ys:
+            self.refresh_lines(cursor_y)
 
     def _restart_blink(self) -> None:
         """Reset the cursor blink timer."""
@@ -1948,6 +2215,37 @@ TextArea {
     async def _on_mouse_down(self, event: events.MouseDown) -> None:
         """Update the cursor position, and begin a selection using the mouse."""
         target = self.get_target_document_location(event)
+
+        if event.meta:
+            # Cmd/Windows-key + click adds or removes an additional cursor.
+            event.stop()
+            event.prevent_default()
+            self._toggle_cursor_at(target)
+            self.record_cursor_width()
+            self._restart_blink()
+            self.history.checkpoint()
+            return
+
+        if event.shift:
+            # Shift + click extends the primary selection while keeping any
+            # additional selections intact.
+            event.stop()
+            event.prevent_default()
+            selections = list(self.selections)
+            try:
+                primary_index = selections.index(self.selection)
+            except ValueError:
+                primary_index = len(selections) - 1
+            selections[primary_index] = Selection(
+                selections[primary_index].start, target
+            )
+            self._set_selections(selections, primary=target)
+            self._selecting = True
+            self.capture_mouse()
+            self._pause_blink(visible=False)
+            self.history.checkpoint()
+            return
+
         self.selection = Selection.cursor(target)
         self._selecting = True
         # Capture the mouse so that if the cursor moves outside the
@@ -1960,8 +2258,24 @@ TextArea {
         """Handles click and drag to expand and contract the selection."""
         if self._selecting:
             target = self.get_target_document_location(event)
+            if event.meta:
+                # Dragging with the multi-cursor modifier adds cursors along
+                # the path of the drag.
+                self.add_cursor(target)
+                return
             selection_start, _ = self.selection
-            self.selection = Selection(selection_start, target)
+            updated_selection = Selection(selection_start, target)
+            if len(self.selections) > 1:
+                # Extend only the primary selection.
+                selections = list(self.selections)
+                try:
+                    primary_index = selections.index(self.selection)
+                except ValueError:
+                    primary_index = len(selections) - 1
+                selections[primary_index] = updated_selection
+                self._set_selections(selections, primary=target)
+            else:
+                self.selection = updated_selection
 
     def _end_mouse_selection(self) -> None:
         """Finalize the selection that has been made using the mouse."""
@@ -1983,8 +2297,7 @@ TextArea {
         """When a paste occurs, insert the text from the paste event into the document."""
         if self.read_only:
             return
-        if result := self._replace_via_keyboard(event.text, *self.selection):
-            self.move_cursor(result.end_location)
+        if self._insert_at_all_selections(event.text) is not None:
             self.focus()
 
     def cell_width_to_column_index(self, cell_width: int, row_index: int) -> int:
@@ -2021,6 +2334,230 @@ TextArea {
         column = clamp(column, 0, len(line_text))
 
         return row, column
+
+    # --- Multiple selections (multi-cursor editing)
+    @property
+    def selections(self) -> tuple[Selection, ...]:
+        """All of the active selections, ordered by their position in the document.
+
+        Each `Selection` represents a cursor (when empty) or a selected range. The
+        primary selection (the one [`selection`][textual.widgets.TextArea.selection]
+        refers to, and where editing originates) is included in the returned tuple.
+
+        Assigning a sequence of selections validates and normalises them: endpoints
+        are clamped to the document, the selections are ordered by document position,
+        duplicate cursors are removed, and selections which overlap (including a
+        cursor resting on or inside another selection) are merged.
+        """
+        return self._selections
+
+    @selections.setter
+    def selections(
+        self, selections: Selection | Iterable[Selection]
+    ) -> None:
+        self._set_selections(selections)
+
+    def _normalize_selections(
+        self,
+        selections: Selection | Iterable[Selection],
+        primary: Selection | Location | None = None,
+    ) -> tuple[tuple[Selection, ...], Selection]:
+        """Validate and normalise a collection of selections.
+
+        Args:
+            selections: A single selection or an iterable of selections.
+            primary: The selection or cursor location which should be considered
+                primary after normalisation. If `None`, the last selection in
+                document order is primary.
+
+        Returns:
+            A tuple of normalised selections (document order, with overlaps merged)
+            and the primary selection.
+
+        Raises:
+            ValueError: If no selections are provided.
+        """
+        if isinstance(selections, Selection):
+            selection_list = [selections]
+        else:
+            selection_list = list(selections)
+        if not selection_list:
+            raise ValueError(
+                "A TextArea must always contain at least one selection."
+            )
+
+        clamp_visitable = self.clamp_visitable
+        intervals: list[tuple[Location, Location, Selection]] = []
+        for selection in selection_list:
+            start = clamp_visitable(selection.start)
+            end = clamp_visitable(selection.end)
+            intervals.append((min(start, end), max(start, end), Selection(start, end)))
+        intervals.sort(key=lambda item: (item[0], item[1]))
+
+        # Merge intervals which overlap or touch (duplicate cursors or a cursor
+        # resting on/inside a selection also merge at this stage).
+        groups: list[list[tuple[Location, Location, Selection]]] = []
+        group_bottoms: list[Location] = []
+        for interval in intervals:
+            top, bottom, _selection = interval
+            if groups and top <= group_bottoms[-1]:
+                groups[-1].append(interval)
+                if bottom > group_bottoms[-1]:
+                    group_bottoms[-1] = bottom
+            else:
+                groups.append([interval])
+                group_bottoms.append(bottom)
+
+        merged: list[tuple[tuple[Location, Location], Selection]] = []
+        for group in groups:
+            if len(group) == 1:
+                top, bottom, original = group[0]
+                merged.append(((top, bottom), original))
+            else:
+                top = group[0][0]
+                bottom = max(item[1] for item in group)
+                merged_selection = Selection(top, bottom)
+                merged.append(((top, bottom), merged_selection))
+
+        normalized = tuple(selection for _interval, selection in merged)
+
+        if primary is None:
+            primary_selection = normalized[-1]
+        else:
+            primary_point = (
+                clamp_visitable(primary.end)
+                if isinstance(primary, Selection)
+                else clamp_visitable(primary)
+            )
+            primary_selection = normalized[-1]
+            for (top, bottom), selection in merged:
+                if top <= primary_point <= bottom:
+                    primary_selection = selection
+                    break
+
+        return normalized, primary_selection
+
+    def _set_selections(
+        self,
+        selections: Selection | Iterable[Selection],
+        primary: Selection | Location | None = None,
+    ) -> None:
+        """Normalise and apply a collection of selections.
+
+        Args:
+            selections: The selections to apply.
+            primary: The selection or cursor location to make primary.
+        """
+        normalized, primary_selection = self._normalize_selections(selections, primary)
+        self._apply_selections(normalized, primary_selection)
+
+    def _apply_selections(
+        self,
+        selections: tuple[Selection, ...],
+        primary: Selection,
+    ) -> None:
+        """Apply an already normalised collection of selections.
+
+        Args:
+            selections: The normalised selections.
+            primary: The primary selection, which must be one of `selections`.
+        """
+        self._selections = selections
+        self._selection_sync = True
+        try:
+            self.selection = primary
+        finally:
+            self._selection_sync = False
+        self._line_cache.clear()
+        self.refresh()
+
+    def _restore_selections(
+        self,
+        selections: tuple[Selection, ...] | Iterable[Selection],
+        primary: Selection,
+    ) -> None:
+        """Restore a collection of selections which is already normalised.
+
+        Unlike `_apply_selections`, this does not re-normalise or force a repaint,
+        so it is safe to call from each `Edit.after` hook when applying a batch of
+        edits.
+
+        Args:
+            selections: The normalised selections to restore.
+            primary: The primary selection.
+        """
+        self._selections = tuple(selections)
+        if self.selection == primary:
+            # The primary reactive already points at the right selection, so
+            # don't reassign it (which would post another SelectionChanged).
+            return
+        self._selection_sync = True
+        try:
+            self.selection = primary
+        finally:
+            self._selection_sync = False
+
+    def add_selection(self, selection: Selection) -> None:
+        """Add a selection (or cursor) to the set of active selections.
+
+        Selections which overlap an existing one are merged, and duplicate cursors
+        are ignored. The added selection becomes the primary selection.
+
+        Args:
+            selection: The selection to add.
+        """
+        if not self._has_cursor:
+            return
+        self._set_selections([*self.selections, selection], primary=selection)
+
+    def add_cursor(self, location: Location) -> None:
+        """Add an additional cursor (an empty selection) at the given location.
+
+        If another cursor already exists at `location`, this is a no-op.
+
+        Args:
+            location: The document location to add a cursor at.
+        """
+        self.add_selection(Selection.cursor(location))
+
+    def _remove_selection(self, selection: Selection) -> bool:
+        """Remove a selection from the set of active selections.
+
+        Args:
+            selection: The selection to remove.
+
+        Returns:
+            True if the selection was removed, False if it was not present or it
+            was the only remaining selection.
+        """
+        current = list(self.selections)
+        if len(current) <= 1 or selection not in current:
+            return False
+        index = current.index(selection)
+        remaining = [item for item in current if item != selection]
+        new_primary = remaining[min(index, len(remaining) - 1)]
+        self._set_selections(remaining, primary=new_primary)
+        return True
+
+    def _toggle_cursor_at(self, location: Location) -> None:
+        """Add a cursor at a location, or remove it if an empty cursor is already
+        resting there (used by the multi-cursor mouse gesture).
+
+        Args:
+            location: The document location to toggle a cursor at.
+        """
+        existing = next(
+            (
+                selection
+                for selection in self.selections
+                if selection.is_empty and selection.end == location
+            ),
+            None,
+        )
+        if existing is not None:
+            self._remove_selection(existing)
+        else:
+            self.add_cursor(location)
 
     # --- Cursor/selection utilities
     def scroll_cursor_visible(
@@ -2068,11 +2605,21 @@ TextArea {
         """
         if not self._has_cursor:
             return
+        location = self.clamp_visitable(location)
         if select:
-            start, _end = self.selection
-            self.selection = Selection(start, location)
+            # Extend the primary selection, keeping any additional selections.
+            selections = list(self.selections)
+            try:
+                primary_index = selections.index(self.selection)
+            except ValueError:
+                primary_index = len(selections) - 1
+            selections[primary_index] = Selection(
+                selections[primary_index].start, location
+            )
+            self._set_selections(selections, primary=location)
         else:
-            self.selection = Selection.cursor(location)
+            # Moving the cursor without selecting collapses to a single selection.
+            self._set_selections(Selection.cursor(location), primary=location)
 
         if record_width:
             self.record_cursor_width()
@@ -2080,6 +2627,51 @@ TextArea {
         if center:
             self.scroll_cursor_visible(center)
 
+        self.history.checkpoint()
+
+    def _move_all_selections(
+        self,
+        get_target: Callable[[Selection], Location],
+        *,
+        select: bool = False,
+        record_width: bool = True,
+        center: bool = False,
+    ) -> None:
+        """Apply a movement to every active selection (multi-cursor movement).
+
+        With a single selection this is equivalent to `move_cursor`. With
+        multiple selections, every selection is moved (or extended when
+        `select` is True) simultaneously, and the selection which was primary
+        remains primary.
+
+        Args:
+            get_target: Given a selection, return the location its cursor should
+                move to.
+            select: If True, extend each selection rather than collapsing it.
+            record_width: If True, record the cursor column cell width.
+            center: If True, scroll the primary cursor to the center of the screen.
+        """
+        if not self._has_cursor:
+            return
+
+        current = list(self.selections)
+        targets = [get_target(selection) for selection in current]
+        new_selections = [
+            Selection(selection.start, target) if select else Selection.cursor(target)
+            for selection, target in zip(current, targets)
+        ]
+        try:
+            primary_index = current.index(self.selection)
+        except ValueError:
+            primary_index = len(current) - 1
+        self._set_selections(
+            new_selections, primary=targets[primary_index]
+        )
+
+        if record_width:
+            self.record_cursor_width()
+        if center:
+            self.scroll_cursor_visible(center)
         self.history.checkpoint()
 
     def move_cursor_relative(
@@ -2215,20 +2807,28 @@ TextArea {
         if not self._has_cursor:
             self.scroll_left()
             return
-        target = (
-            self.get_cursor_left_location()
-            if select or self.selection.is_empty
-            else min(*self.selection)
+        self._move_all_selections(
+            lambda selection: (
+                self.get_cursor_left_location(selection.end)
+                if select or selection.is_empty
+                else min(*selection)
+            ),
+            select=select,
         )
-        self.move_cursor(target, select=select)
 
-    def get_cursor_left_location(self) -> Location:
+    def get_cursor_left_location(self, location: Location | None = None) -> Location:
         """Get the location the cursor will move to if it moves left.
+
+        Args:
+            location: The location to move from. If `None`, the primary cursor
+                location is used.
 
         Returns:
             The location of the cursor if it moves left.
         """
-        return self.navigator.get_location_left(self.cursor_location)
+        return self.navigator.get_location_left(
+            location if location is not None else self.cursor_location
+        )
 
     def action_cursor_right(self, select: bool = False) -> None:
         """Move the cursor one location to the right.
@@ -2246,20 +2846,30 @@ TextArea {
         if self.suggestion:
             self.insert(self.suggestion)
             return
-        target = (
-            self.get_cursor_right_location()
-            if select or self.selection.is_empty
-            else max(*self.selection)
+        self._move_all_selections(
+            lambda selection: (
+                self.get_cursor_right_location(selection.end)
+                if select or selection.is_empty
+                else max(*selection)
+            ),
+            select=select,
         )
-        self.move_cursor(target, select=select)
 
-    def get_cursor_right_location(self) -> Location:
+    def get_cursor_right_location(
+        self, location: Location | None = None
+    ) -> Location:
         """Get the location the cursor will move to if it moves right.
+
+        Args:
+            location: The location to move from. If `None`, the primary cursor
+                location is used.
 
         Returns:
             the location the cursor will move to if it moves right.
         """
-        return self.navigator.get_location_right(self.cursor_location)
+        return self.navigator.get_location_right(
+            location if location is not None else self.cursor_location
+        )
 
     def action_cursor_down(self, select: bool = False) -> None:
         """Move the cursor down one cell.
@@ -2270,16 +2880,27 @@ TextArea {
         if not self._has_cursor:
             self.scroll_down()
             return
-        target = self.get_cursor_down_location()
-        self.move_cursor(target, record_width=False, select=select)
+        self._move_all_selections(
+            lambda selection: self.get_cursor_down_location(selection.end),
+            select=select,
+            record_width=False,
+        )
 
-    def get_cursor_down_location(self) -> Location:
+    def get_cursor_down_location(
+        self, location: Location | None = None
+    ) -> Location:
         """Get the location the cursor will move to if it moves down.
+
+        Args:
+            location: The location to move from. If `None`, the primary cursor
+                location is used.
 
         Returns:
             The location the cursor will move to if it moves down.
         """
-        return self.navigator.get_location_below(self.cursor_location)
+        return self.navigator.get_location_below(
+            location if location is not None else self.cursor_location
+        )
 
     def action_cursor_up(self, select: bool = False) -> None:
         """Move the cursor up one cell.
@@ -2290,54 +2911,84 @@ TextArea {
         if not self._has_cursor:
             self.scroll_up()
             return
-        target = self.get_cursor_up_location()
-        self.move_cursor(target, record_width=False, select=select)
+        self._move_all_selections(
+            lambda selection: self.get_cursor_up_location(selection.end),
+            select=select,
+            record_width=False,
+        )
 
-    def get_cursor_up_location(self) -> Location:
+    def get_cursor_up_location(
+        self, location: Location | None = None
+    ) -> Location:
         """Get the location the cursor will move to if it moves up.
+
+        Args:
+            location: The location to move from. If `None`, the primary cursor
+                location is used.
 
         Returns:
             The location the cursor will move to if it moves up.
         """
-        return self.navigator.get_location_above(self.cursor_location)
+        return self.navigator.get_location_above(
+            location if location is not None else self.cursor_location
+        )
 
     def action_cursor_line_end(self, select: bool = False) -> None:
         """Move the cursor to the end of the line."""
         if not self._has_cursor:
             self.scroll_end()
             return
-        location = self.get_cursor_line_end_location()
-        self.move_cursor(location, select=select)
+        self._move_all_selections(
+            lambda selection: self.get_cursor_line_end_location(selection.end),
+            select=select,
+        )
 
-    def get_cursor_line_end_location(self) -> Location:
+    def get_cursor_line_end_location(
+        self, location: Location | None = None
+    ) -> Location:
         """Get the location of the end of the current line.
+
+        Args:
+            location: The location to find the line end from. If `None`, the
+                primary cursor location is used.
 
         Returns:
             The (row, column) location of the end of the cursors current line.
         """
-        return self.navigator.get_location_end(self.cursor_location)
+        return self.navigator.get_location_end(
+            location if location is not None else self.cursor_location
+        )
 
     def action_cursor_line_start(self, select: bool = False) -> None:
         """Move the cursor to the start of the line."""
         if not self._has_cursor:
             self.scroll_home()
             return
-        target = self.get_cursor_line_start_location(smart_home=True)
-        self.move_cursor(target, select=select)
+        self._move_all_selections(
+            lambda selection: self.get_cursor_line_start_location(
+                smart_home=True, location=selection.end
+            ),
+            select=select,
+        )
 
-    def get_cursor_line_start_location(self, smart_home: bool = False) -> Location:
+    def get_cursor_line_start_location(
+        self, smart_home: bool = False, location: Location | None = None
+    ) -> Location:
         """Get the location of the start of the current line.
 
         Args:
             smart_home: If True, use "smart home key" behavior - go to the first
                 non-whitespace character on the line, and if already there, go to
                 offset 0. Smart home only works when wrapping is disabled.
+            location: The location to find the line start from. If `None`, the
+                primary cursor location is used.
 
         Returns:
             The (row, column) location of the start of the cursors current line.
         """
         return self.navigator.get_location_home(
-            self.cursor_location, smart_home=smart_home
+            location if location is not None else self.cursor_location,
+            smart_home=smart_home,
         )
 
     def action_cursor_word_left(self, select: bool = False) -> None:
@@ -2350,16 +3001,26 @@ TextArea {
             return
         if self.cursor_at_start_of_text:
             return
-        target = self.get_cursor_word_left_location()
-        self.move_cursor(target, select=select)
+        self._move_all_selections(
+            lambda selection: self.get_cursor_word_left_location(selection.end),
+            select=select,
+        )
 
-    def get_cursor_word_left_location(self) -> Location:
+    def get_cursor_word_left_location(
+        self, location: Location | None = None
+    ) -> Location:
         """Get the location the cursor will jump to if it goes 1 word left.
+
+        Args:
+            location: The location to jump from. If `None`, the primary cursor
+                location is used.
 
         Returns:
             The location the cursor will jump on "jump word left".
         """
-        cursor_row, cursor_column = self.cursor_location
+        cursor_row, cursor_column = (
+            location if location is not None else self.cursor_location
+        )
         if cursor_row > 0 and cursor_column == 0:
             # Going to the previous row
             return cursor_row - 1, len(self.document[cursor_row - 1])
@@ -2378,16 +3039,26 @@ TextArea {
         if self.cursor_at_end_of_text:
             return
 
-        target = self.get_cursor_word_right_location()
-        self.move_cursor(target, select=select)
+        self._move_all_selections(
+            lambda selection: self.get_cursor_word_right_location(selection.end),
+            select=select,
+        )
 
-    def get_cursor_word_right_location(self) -> Location:
+    def get_cursor_word_right_location(
+        self, location: Location | None = None
+    ) -> Location:
         """Get the location the cursor will jump to if it goes 1 word right.
+
+        Args:
+            location: The location to jump from. If `None`, the primary cursor
+                location is used.
 
         Returns:
             The location the cursor will jump on "jump word right".
         """
-        cursor_row, cursor_column = self.selection.end
+        cursor_row, cursor_column = (
+            location if location is not None else self.selection.end
+        )
         line = self.document[cursor_row]
         if cursor_row < self.document.line_count - 1 and cursor_column == len(line):
             # Moving to the line below
@@ -2413,13 +3084,12 @@ TextArea {
             self.scroll_page_up()
             return
         height = self.content_size.height
-        _, cursor_location = self.selection
-        target = self.navigator.get_location_at_y_offset(
-            cursor_location,
-            -height,
+        self._move_all_selections(
+            lambda selection: self.navigator.get_location_at_y_offset(
+                selection.end, -height
+            ),
         )
         self.scroll_relative(y=-height, animate=False)
-        self.move_cursor(target)
 
     def action_cursor_page_down(self) -> None:
         """Move the cursor and scroll down one page."""
@@ -2427,13 +3097,28 @@ TextArea {
             self.scroll_page_down()
             return
         height = self.content_size.height
-        _, cursor_location = self.selection
-        target = self.navigator.get_location_at_y_offset(
-            cursor_location,
-            height,
+        self._move_all_selections(
+            lambda selection: self.navigator.get_location_at_y_offset(
+                selection.end, height
+            ),
         )
         self.scroll_relative(y=height, animate=False)
-        self.move_cursor(target)
+
+    def action_add_cursor_above(self) -> None:
+        """Add an additional cursor on the visual line above the primary cursor."""
+        if not self._has_cursor:
+            return
+        target = self.get_cursor_up_location()
+        if target != self.selection.end:
+            self.add_cursor(target)
+
+    def action_add_cursor_below(self) -> None:
+        """Add an additional cursor on the visual line below the primary cursor."""
+        if not self._has_cursor:
+            return
+        target = self.get_cursor_down_location()
+        if target != self.selection.end:
+            self.add_cursor(target)
 
     def get_column_width(self, row: int, column: int) -> int:
         """Get the cell offset of the column from the start of the row.
@@ -2588,13 +3273,7 @@ TextArea {
         if self.read_only:
             return
 
-        selection = self.selection
-        start, end = selection
-
-        if selection.is_empty:
-            end = self.get_cursor_left_location()
-
-        self._delete_via_keyboard(start, end)
+        self._delete_at_all_selections(self._delete_left_range)
 
     def action_delete_right(self) -> None:
         """Deletes the character to the right of the cursor and keeps the cursor at the same location.
@@ -2603,19 +3282,107 @@ TextArea {
         if self.read_only:
             return
 
-        selection = self.selection
+        self._delete_at_all_selections(self._delete_right_range)
+
+    def _delete_left_range(  # type: ignore[no-redef]
+        self, selection: Selection
+    ) -> tuple[Location, Location]:
         start, end = selection
-
         if selection.is_empty:
-            end = self.get_cursor_right_location()
+            end = self.get_cursor_left_location(end)
+        return start, end
 
-        self._delete_via_keyboard(start, end)
+    def _delete_right_range(
+        self, selection: Selection
+    ) -> tuple[Location, Location]:
+        start, end = selection
+        if selection.is_empty:
+            end = self.get_cursor_right_location(end)
+        return start, end
 
     def action_delete_line(self) -> None:
         """Deletes the lines which intersect with the selection."""
         if self.read_only:
             return
-        self._delete_cursor_line()
+        if len(self.selections) > 1:
+            self._delete_lines_at_all_selections()
+        else:
+            self._delete_cursor_line()
+
+    def _line_deletion_specs(
+        self, selections: Sequence[Selection]
+    ) -> list[tuple[Location, Location, int]]:
+        """Compute the line ranges to delete for a collection of selections.
+
+        Args:
+            selections: The selections whose lines should be deleted.
+
+        Returns:
+            A sorted list of `(from_location, to_location, cursor_column)`
+            tuples, with overlapping/contacting ranges merged. The
+            `cursor_column` is the column the cursor should rest at after the
+            lines are removed.
+        """
+        specs: list[tuple[Location, Location, int]] = []
+        for selection in selections:
+            start, end = sorted((selection.start, selection.end))
+            start_row, _start_column = start
+            end_row, end_column = end
+
+            # Generally editors will only delete line the end line of the
+            # selection if the cursor is not at column 0 of that line.
+            if start_row != end_row and end_column == 0 and end_row >= 0:
+                end_row -= 1
+
+            specs.append(((start_row, 0), (end_row + 1, 0), end_column))
+
+        specs.sort(key=lambda spec: (spec[0], spec[1]))
+        merged: list[tuple[Location, Location, int]] = []
+        for top, bottom, column in specs:
+            if merged and top <= merged[-1][1]:
+                previous_top, previous_bottom, _previous_column = merged[-1]
+                merged[-1] = (
+                    previous_top,
+                    max(previous_bottom, bottom),
+                    _previous_column,
+                )
+            else:
+                merged.append((top, bottom, column))
+        return merged
+
+    def _delete_lines_at_all_selections(self) -> list[EditResult] | None:
+        """Delete the lines intersecting every active selection simultaneously.
+
+        Returns:
+            An `EditResult` per applied edit, or `None` if no edit was performed.
+        """
+        selections = list(self.selections)
+        primary_point = self.selection.end
+        specs = self._line_deletion_specs(selections)
+
+        edits: list[Edit] = []
+        cursor_locations: list[Location] = []
+        primary_cursor: Location | None = None
+        # Lines removed by edits earlier in the document shift the final rows of
+        # edits further down, so accumulate the offset as we walk document order.
+        removed_rows_above = 0
+        for top, bottom, column in specs:
+            edits.append(Edit("", top, bottom, maintain_selection_offset=False))
+            # After deletion the next remaining line joins at `top`.
+            next_row = bottom[0]
+            if next_row < self.document.line_count:
+                target_column = min(column, len(self.document[next_row]))
+            else:
+                target_column = 0
+            target_row = top[0] - removed_rows_above
+            target = (target_row, target_column)
+            cursor_locations.append(target)
+            removed_rows_above += bottom[0] - top[0]
+            if top <= primary_point <= bottom:
+                primary_cursor = target
+        if primary_cursor is None:
+            primary_cursor = cursor_locations[-1]
+        return self._apply_edits(edits, cursor_locations=cursor_locations)
 
     def _delete_cursor_line(self) -> EditResult | None:
         """Deletes the line (including the line terminator) that the cursor is on."""
@@ -2641,6 +3408,14 @@ TextArea {
         """Cut text (remove and copy to clipboard)."""
         if self.read_only:
             return
+        if len(self.selections) > 1:
+            results = self._cut_at_all_selections()
+            if results:
+                self.app.copy_to_clipboard(
+                    "\n".join(result.replaced_text for result in results)
+                )
+            return
+
         start, end = self.selection
         if start == end:
             edit_result = self._delete_cursor_line()
@@ -2650,9 +3425,44 @@ TextArea {
         if edit_result is not None:
             self.app.copy_to_clipboard(edit_result.replaced_text)
 
+    def _cut_at_all_selections(self) -> list[EditResult]:
+        """Cut the selected text (or current line for empty cursors) at every
+        active selection.
+
+        Returns:
+            An `EditResult` per applied edit (empty edits are omitted).
+        """
+        specs = self._line_deletion_specs(
+            [
+                selection
+                for selection in self.selections
+                if selection.is_empty
+            ]
+        )
+        ranges: list[tuple[Location, Location]] = []
+        for selection in self.selections:
+            if selection.is_empty:
+                for top, bottom, _column in specs:
+                    if top <= selection.end <= bottom:
+                        ranges.append((top, bottom))
+                        break
+            else:
+                ranges.append((selection.start, selection.end))
+        results = self._replace_ranges("", ranges)
+        return [result for result in (results or []) if result.replaced_text]
+
     def action_copy(self) -> None:
         """Copy selection to clipboard."""
-        selected_text = self.selected_text
+        selections = [
+            selection for selection in self.selections if not selection.is_empty
+        ]
+        if len(selections) > 1:
+            selected_text = "\n".join(
+                self.get_text_range(selection.start, selection.end)
+                for selection in selections
+            )
+        else:
+            selected_text = self.selected_text
         if selected_text:
             self.app.copy_to_clipboard(selected_text)
         else:
@@ -2662,31 +3472,35 @@ TextArea {
         """Paste from local clipboard."""
         if self.read_only:
             return
-        clipboard = self.app.clipboard
-        if result := self._replace_via_keyboard(clipboard, *self.selection):
-            self.move_cursor(result.end_location)
+        self._insert_at_all_selections(self.app.clipboard)
 
     def action_delete_to_start_of_line(self) -> None:
         """Deletes from the cursor location to the start of the line."""
         if self.read_only:
             return
 
-        if self.cursor_at_start_of_line:
-            selection = self.selection
-            start, end = selection
-            if selection.is_empty:
-                end = self.get_cursor_left_location()
-            self._delete_via_keyboard(start, end)
-        else:
-            from_location = self.selection.end
-            to_location = self.get_cursor_line_start_location()
-            self._delete_via_keyboard(from_location, to_location)
+        self._delete_at_all_selections(self._delete_to_line_start_range)
+
+    def _delete_to_line_start_range(
+        self, selection: Selection
+    ) -> tuple[Location, Location]:
+        start, end = selection
+        line_start = self.get_cursor_line_start_location(location=end)
+        if end == line_start:
+            # At the start of a line, delete the line terminator to the left.
+            return start, self.get_cursor_left_location(end)
+        return end, line_start
 
     def action_delete_to_end_of_line(self) -> None:
         """Deletes from the cursor location to the end of the line."""
-        from_location = self.selection.end
-        to_location = self.get_cursor_line_end_location()
-        self._delete_via_keyboard(from_location, to_location)
+        if self.read_only:
+            return
+        self._delete_at_all_selections(
+            lambda selection: (
+                selection.end,
+                self.get_cursor_line_end_location(selection.end),
+            )
+        )
 
     async def action_delete_to_end_of_line_or_delete_line(self) -> None:
         """Deletes from the cursor location to the end of the line, or deletes the line.
@@ -2710,18 +3524,51 @@ TextArea {
 
     def action_delete_word_left(self) -> None:
         """Deletes the word to the left of the cursor and updates the cursor location."""
+        if self.read_only:
+            return
         if self.cursor_at_start_of_text:
             return
+        self._delete_at_all_selections(self._delete_word_left_range)
 
+    def _delete_word_left_range(
+        self, selection: Selection
+    ) -> tuple[Location, Location]:
+        start, end = selection
         # If there's a non-zero selection, then "delete word left" typically only
         # deletes the characters within the selection range, ignoring word boundaries.
-        start, end = self.selection
         if start != end:
-            self._delete_via_keyboard(start, end)
-            return
+            return start, end
+        return self.get_cursor_word_left_location(end), end
 
-        to_location = self.get_cursor_word_left_location()
-        self._delete_via_keyboard(self.selection.end, to_location)
+    def _delete_word_right_location(self, location: Location) -> Location:
+        """Find the location deleted up to when deleting a word to the right.
+
+        Note that the location that we delete to using this action is not the same
+        as the location we move to when we move the cursor one word to the right.
+        This action does not skip leading whitespace, whereas cursor movement does.
+
+        Args:
+            location: The cursor location to delete from.
+
+        Returns:
+            The location of the end of the word to the right.
+        """
+        cursor_row, cursor_column = location
+
+        # Check the current line for a word boundary
+        line = self.document[cursor_row][cursor_column:]
+        matches = list(re.finditer(r"\s*\w+", line))
+
+        current_row_length = len(self.document[cursor_row])
+        if matches:
+            return cursor_row, cursor_column + matches[0].end()
+        elif (
+            cursor_row < self.document.line_count - 1
+            and cursor_column == current_row_length
+        ):
+            return cursor_row + 1, 0
+        else:
+            return cursor_row, current_row_length
 
     def action_delete_word_right(self) -> None:
         """Deletes the word to the right of the cursor and keeps the cursor at the same location.
@@ -2730,32 +3577,19 @@ TextArea {
         as the location we move to when we move the cursor one word to the right.
         This action does not skip leading whitespace, whereas cursor movement does.
         """
+        if self.read_only:
+            return
         if self.cursor_at_end_of_text:
             return
+        self._delete_at_all_selections(self._delete_word_right_range)
 
-        start, end = self.selection
+    def _delete_word_right_range(
+        self, selection: Selection
+    ) -> tuple[Location, Location]:
+        start, end = selection
         if start != end:
-            self._delete_via_keyboard(start, end)
-            return
-
-        cursor_row, cursor_column = end
-
-        # Check the current line for a word boundary
-        line = self.document[cursor_row][cursor_column:]
-        matches = list(re.finditer(r"\s*\w+", line))
-
-        current_row_length = len(self.document[cursor_row])
-        if matches:
-            to_location = (cursor_row, cursor_column + matches[0].end())
-        elif (
-            cursor_row < self.document.line_count - 1
-            and cursor_column == current_row_length
-        ):
-            to_location = (cursor_row + 1, 0)
-        else:
-            to_location = (cursor_row, current_row_length)
-
-        self._delete_via_keyboard(end, to_location)
+            return start, end
+        return end, self._delete_word_right_location(end)
 
 
 @lru_cache(maxsize=128)

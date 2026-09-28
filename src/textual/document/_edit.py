@@ -9,6 +9,42 @@ if TYPE_CHECKING:
     from textual.widgets import TextArea
 
 
+def _adjust_location_for_edit(
+    location: Location,
+    edit_bottom: Location,
+    new_edit_end: Location,
+) -> Location:
+    """Map a location in the document to its new position after an edit.
+
+    Locations at or after the edit (in document order) are shifted by the
+    amount the edit changed the document by. Locations before the edit are
+    unaffected.
+
+    Args:
+        location: The location to map.
+        edit_bottom: The end location of the range that was replaced.
+        new_edit_end: The end location reported by the completed edit.
+
+    Returns:
+        The mapped location.
+    """
+    row, column = location
+    edit_bottom_row, edit_bottom_column = edit_bottom
+    new_edit_to_row, new_edit_to_column = new_edit_end
+
+    column_offset = new_edit_to_column - edit_bottom_column
+    target_column = (
+        column + column_offset
+        if edit_bottom_row == row and edit_bottom_column <= column
+        else column
+    )
+
+    row_offset = new_edit_to_row - edit_bottom_row
+    target_row = row + row_offset if edit_bottom_row <= row else row
+
+    return target_row, target_column
+
+
 @dataclass
 class Edit:
     """Implements the Undoable protocol to replace text at some range within a document."""
@@ -26,10 +62,36 @@ class Edit:
     """If True, the selection will maintain its offset to the replacement range."""
 
     _original_selection: Selection | None = field(init=False, default=None)
-    """The Selection when the edit was originally performed, to be restored on undo."""
+    """The primary Selection when the edit was originally performed, to be restored on undo."""
 
     _updated_selection: Selection | None = field(init=False, default=None)
-    """Where the selection should move to after the replace happens."""
+    """Where the primary selection should be after the edit is (re)done."""
+
+    _original_selections: tuple[Selection, ...] | None = field(
+        init=False, default=None
+    )
+    """All selections (including multiple cursors) when the edit was originally
+    performed, to be restored on undo."""
+
+    _updated_selections: tuple[Selection, ...] | None = field(
+        init=False, default=None
+    )
+    """Where all the selections should be after the edit is (re)done.
+
+    The primary selection is stored separately in `_updated_selection`.
+    """
+
+    _restore_selection: Selection | None = field(init=False, default=None)
+    """The primary selection `after` should currently restore."""
+
+    _restore_selections: tuple[Selection, ...] | None = field(
+        init=False, default=None
+    )
+    """The full set of selections `after` should currently restore."""
+
+    _primary_edit: bool = field(init=False, default=False)
+    """True if this edit corresponds to the primary selection within a group of
+    edits performed simultaneously (e.g. editing with multiple cursors)."""
 
     _edit_result: EditResult | None = field(init=False, default=None)
     """The result of doing the edit."""
@@ -39,15 +101,14 @@ class Edit:
 
         Args:
             text_area: The `TextArea` to perform the edit on.
-            record_selection: If True, record the current selection in the TextArea
-                so that it may be restored if this Edit is undone in the future.
+            record_selection: If True, record the current selection(s) in the
+                TextArea so that they may be restored if this Edit is undone in
+                the future. When redoing an edit this is False, since the
+                selection state to restore is already recorded on the edit.
 
         Returns:
             An `EditResult` containing information about the replace operation.
         """
-        if record_selection:
-            self._original_selection = text_area.selection
-
         text = self.text
 
         # This code is mostly handling how we adjust TextArea.selection
@@ -56,52 +117,76 @@ class Edit:
         # position in the document even if an insert happens before
         # their cursor position.
 
-        edit_bottom_row, edit_bottom_column = self.bottom
+        edit_bottom = self.bottom
 
-        selection_start, selection_end = text_area.selection
-        selection_start_row, selection_start_column = selection_start
-        selection_end_row, selection_end_column = selection_end
+        edit_result = text_area.document.replace_range(self.top, edit_bottom, text)
+        new_edit_end_location = edit_result.end_location
 
-        edit_result = text_area.document.replace_range(self.top, self.bottom, text)
+        if record_selection:
+            self._original_selection = text_area.selection
+            self._original_selections = text_area.selections
 
-        new_edit_to_row, new_edit_to_column = edit_result.end_location
+            # Map every active selection through the edit so that additional
+            # cursors are maintained alongside the primary one.
+            original_selections = text_area.selections
+            try:
+                primary_index = list(original_selections).index(text_area.selection)
+            except ValueError:
+                primary_index = len(original_selections) - 1
 
-        column_offset = new_edit_to_column - edit_bottom_column
-        target_selection_start_column = (
-            selection_start_column + column_offset
-            if edit_bottom_row == selection_start_row
-            and edit_bottom_column <= selection_start_column
-            else selection_start_column
-        )
-        target_selection_end_column = (
-            selection_end_column + column_offset
-            if edit_bottom_row == selection_end_row
-            and edit_bottom_column <= selection_end_column
-            else selection_end_column
-        )
+            if self.maintain_selection_offset:
+                mapped = [
+                    self._map_selection(
+                        selection, edit_bottom, new_edit_end_location
+                    )
+                    for selection in original_selections
+                ]
+            else:
+                # A keyboard-style edit collapses every cursor to the edit end.
+                mapped = [Selection.cursor(new_edit_end_location)]
 
-        row_offset = new_edit_to_row - edit_bottom_row
-        target_selection_start_row = (
-            selection_start_row + row_offset
-            if edit_bottom_row <= selection_start_row
-            else selection_start_row
-        )
-        target_selection_end_row = (
-            selection_end_row + row_offset
-            if edit_bottom_row <= selection_end_row
-            else selection_end_row
-        )
-
-        if self.maintain_selection_offset:
-            self._updated_selection = Selection(
-                start=(target_selection_start_row, target_selection_start_column),
-                end=(target_selection_end_row, target_selection_end_column),
+            normalized, primary = text_area._normalize_selections(
+                mapped, primary=mapped[primary_index]
             )
-        else:
-            self._updated_selection = Selection.cursor(edit_result.end_location)
+            self._updated_selections = normalized
+            self._updated_selection = primary
+
+        # Doing the edit (including redoing it) restores the post-edit state.
+        # When `record_selection` is False the fields may have been recorded by
+        # an earlier call (redo), or may be populated by the caller afterwards
+        # (a group of simultaneous edits), so only point the restore targets at
+        # them when they exist.
+        if self._updated_selections is not None:
+            self._restore_selections = self._updated_selections
+        if self._updated_selection is not None:
+            self._restore_selection = self._updated_selection
 
         self._edit_result = edit_result
         return edit_result
+
+    @staticmethod
+    def _map_selection(
+        selection: Selection,
+        edit_bottom: Location,
+        new_edit_end: Location,
+    ) -> Selection:
+        """Map both ends of a selection through an edit, preserving orientation.
+
+        Args:
+            selection: The selection to map.
+            edit_bottom: The end location of the range that was replaced.
+            new_edit_end: The end location reported by the completed edit.
+
+        Returns:
+            A new selection with both endpoints mapped.
+        """
+        target_start = _adjust_location_for_edit(
+            selection.start, edit_bottom, new_edit_end
+        )
+        target_end = _adjust_location_for_edit(
+            selection.end, edit_bottom, new_edit_end
+        )
+        return Selection(target_start, target_end)
 
     def undo(self, text_area: TextArea) -> EditResult:
         """Undo the edit operation.
@@ -121,7 +206,10 @@ class Edit:
         undo_edit_result = text_area.document.replace_range(
             self.top, edit_end, replaced_text
         )
-        self._updated_selection = self._original_selection
+
+        # Undoing restores the state captured just before the edit.
+        self._restore_selection = self._original_selection
+        self._restore_selections = self._original_selections
 
         return undo_edit_result
 
@@ -136,8 +224,13 @@ class Edit:
         Args:
             text_area: The `TextArea` this operation was performed on.
         """
-        if self._updated_selection is not None:
-            text_area.selection = self._updated_selection
+        if self._restore_selections is not None:
+            # Restore the full set of selections (multi-cursor editing).
+            text_area._restore_selections(
+                self._restore_selections, self._restore_selection
+            )
+        elif self._restore_selection is not None:
+            text_area.selection = self._restore_selection
         text_area.record_cursor_width()
 
     @property
